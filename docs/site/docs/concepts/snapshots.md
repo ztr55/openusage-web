@@ -93,11 +93,12 @@ UsageSnapshot
               ▼
          ReadModel
               │
-              ▼
-       UsageSnapshot
-              │
-              ▼
-       UDS /v1/read-model ─► render
+       ▼
+        UsageSnapshot
+               │
+               ├─► UDS /v1/read-model ─► TUI render
+               │
+               └─► loopback /api/v1/snapshots ─► web render
 ```
 
 The snapshot returned to the TUI is rebuilt from stored events on each request. That means historical data persists across TUI restarts and daemon restarts.

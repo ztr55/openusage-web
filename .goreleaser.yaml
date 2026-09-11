@@ -5,6 +5,7 @@ project_name: openusage
 before:
   hooks:
     - go mod tidy
+    - make website-build
 
 builds:
   # --- Linux amd64 ---

@@ -126,3 +126,21 @@ func TestResolveHideCosts_PlanCaseInsensitive(t *testing.T) {
 		t.Fatalf("expected mixed-case Active to hide costs")
 	}
 }
+
+func TestResolveHideCosts_UsesNormalizedAttributes(t *testing.T) {
+	snap := UsageSnapshot{
+		ProviderID: "claude_code",
+		Attributes: map[string]string{"subscription": "active"},
+	}
+	if !ResolveHideCosts(snap, nil, nil) {
+		t.Fatal("expected normalized subscription attribute to hide costs")
+	}
+
+	snap = UsageSnapshot{
+		ProviderID: "codex",
+		Attributes: map[string]string{"plan_type": "team"},
+	}
+	if !ResolveHideCosts(snap, nil, nil) {
+		t.Fatal("expected normalized plan attribute to hide costs")
+	}
+}

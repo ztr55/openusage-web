@@ -12,6 +12,7 @@ providers and (optionally) the same local history.
 | Surface | Command | Use it when |
 | --- | --- | --- |
 | [Live dashboard](#live-terminal-dashboard) | `openusage` | You want the full interactive view |
+| [Web dashboard](#local-web-dashboard) | `openusage web` | You want a responsive browser UI on this machine |
 | [CLI reports](#headless-cli-reports) | `openusage daily` (`--json`) | Scripting, CI, a quick check |
 | [Claude Code statusline](#claude-code-statusline) | `openusage statusline --install` | You live in Claude Code |
 | [tmux status bar](#tmux-status-bar) | `openusage tmux install` | You live in tmux |
@@ -29,6 +30,28 @@ openusage
 ```
 
 See [first run](./first-run.md).
+
+## Local web dashboard
+
+The browser dashboard is a local companion to the terminal dashboard. It reads
+the daemon's existing read model over the Unix socket and serves the React UI
+from a loopback HTTP server. It supports the overview, analytics, provider
+details, settings, API-key validation, browser-session connection, and tool
+integration controls.
+
+Build the website from a source checkout, then run:
+
+```bash
+make website-install website-build build
+openusage web
+```
+
+The command opens `http://127.0.0.1:8787/app/` by default. Use
+`--no-open` to print the URL without launching a browser or `--static-dir` to
+point at another built website directory. The server refuses non-loopback bind
+addresses because the API can manage local credentials and files.
+
+For a container deployment, see the [Docker web dashboard guide](../guides/web-dashboard.md).
 
 ## Headless CLI reports
 

@@ -89,9 +89,19 @@ func (s *Service) DeleteProviderLink(source string) error {
 }
 
 func (s *Service) ValidateAPIKey(accountID, providerID, apiKey string) (bool, string) {
+	return s.ValidateAPIKeyForAccount(core.AccountConfig{
+		ID:       accountID,
+		Provider: providerID,
+	}, apiKey)
+}
+
+// ValidateAPIKeyForAccount validates a key using the complete account
+// configuration. This matters for providers with custom endpoints or probe
+// models; the browser settings flow must not discard those account fields.
+func (s *Service) ValidateAPIKeyForAccount(account core.AccountConfig, apiKey string) (bool, string) {
 	var provider core.UsageProvider
 	for _, p := range providers.AllProviders() {
-		if p.ID() == providerID {
+		if p.ID() == account.Provider {
 			provider = p
 			break
 		}
@@ -103,11 +113,8 @@ func (s *Service) ValidateAPIKey(accountID, providerID, apiKey string) (bool, st
 	ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 	defer cancel()
 
-	snap, err := provider.Fetch(ctx, core.AccountConfig{
-		ID:       accountID,
-		Provider: providerID,
-		Token:    apiKey,
-	})
+	account.Token = apiKey
+	snap, err := provider.Fetch(ctx, account)
 	if err != nil {
 		return false, err.Error()
 	}

@@ -81,9 +81,11 @@ func ApplyRateLimitGroup(h http.Header, snap *core.UsageSnapshot, key, unit, win
 
 func RedactHeaders(headers http.Header, sensitiveKeys ...string) map[string]string {
 	sensitive := map[string]bool{
-		"authorization": true,
-		"x-api-key":     true,
-		"cookie":        true,
+		"authorization":       true,
+		"x-api-key":           true,
+		"cookie":              true,
+		"set-cookie":          true,
+		"proxy-authorization": true,
 	}
 	for _, k := range sensitiveKeys {
 		sensitive[strings.ToLower(k)] = true

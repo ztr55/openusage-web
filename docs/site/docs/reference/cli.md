@@ -11,6 +11,7 @@ The `openusage` binary is the dashboard, the daemon, the hook receiver, and the 
 
 ```
 openusage                                       # run the dashboard (default)
+openusage web                                   # run the local browser dashboard
 openusage version                               # print version and build info
 openusage detect [--all]                        # print credential auto-detection report
 openusage daily|weekly|monthly [flags]          # headless usage/cost report by period
@@ -34,6 +35,23 @@ Runs the TUI dashboard. With no flags it auto-detects accounts, connects to the 
 ### Flags
 
 The default command takes no flags beyond cobra's built-ins. Configuration lives in `~/.config/openusage/settings.json` — see [configuration reference](./configuration.md).
+
+## `openusage web`
+
+Runs the local browser dashboard. The command serves the built website from
+`website/dist`, connects to the existing telemetry daemon over its Unix socket,
+and opens `http://127.0.0.1:8787/app/`.
+
+```bash
+make website-install website-build build
+openusage web
+openusage web --no-open
+openusage web --listen 127.0.0.1:9000 --static-dir ./website/dist
+```
+
+The listen address must include a loopback host unless `--allow-public` is set
+with `OPENUSAGE_WEB_TOKEN`. The web API redacts raw provider metadata and never
+returns API keys or browser-cookie values.
 
 ## `openusage version`
 

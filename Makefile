@@ -17,6 +17,8 @@ endif
 
 GO          := go
 GOFLAGS     :=
+WEBSITE_DIR := website
+WEB_EMBED_DIR := internal/web/static
 LDFLAGS     := -s -w \
                -X '$(MODULE)/internal/version.Version=$(VERSION)' \
                -X '$(MODULE)/internal/version.CommitHash=$(COMMIT_HASH)' \
@@ -71,6 +73,20 @@ run: ## Run the application locally
 .PHONY: build
 build: deps ## Build the binary
 	$(GO) build $(GOFLAGS) -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(APP_NAME)$(EXE) $(CMD_DIR)
+
+.PHONY: website-install
+website-install: ## Install website dependencies
+	cd $(WEBSITE_DIR) && npm ci
+
+.PHONY: website-build
+website-build: ## Build the web dashboard assets
+	cd $(WEBSITE_DIR) && npm run build
+	mkdir -p $(WEB_EMBED_DIR)
+	cp $(WEBSITE_DIR)/dist/index.html $(WEB_EMBED_DIR)/index.html
+	rm -rf $(WEB_EMBED_DIR)/assets $(WEB_EMBED_DIR)/brand $(WEB_EMBED_DIR)/icons
+	cp -R $(WEBSITE_DIR)/dist/assets $(WEB_EMBED_DIR)/assets
+	cp -R $(WEBSITE_DIR)/dist/brand $(WEB_EMBED_DIR)/brand
+	cp -R $(WEBSITE_DIR)/dist/icons $(WEB_EMBED_DIR)/icons
 
 .PHONY: demo
 demo: deps ## Build and run the demo with dummy data (for screenshots)

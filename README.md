@@ -56,6 +56,36 @@ openusage
 
 Auto-detection picks up local tools and common API key env vars. No config needed.
 
+To use the browser dashboard during development, build the website and start the
+local web server:
+
+```bash
+make website-install website-build build
+openusage web
+```
+
+The web server listens on loopback by default and reads the same local daemon
+data as the terminal dashboard. It does not send usage data to OpenUsage or
+expose provider credentials to the browser.
+
+### Docker
+
+Build the web image, then run the daemon and dashboard together with a persistent
+data volume:
+
+```bash
+docker build -f Dockerfile.web -t openusage-web:local .
+TOKEN="$(openssl rand -hex 32)"
+docker run --rm -p 8787:8787 \
+  -e OPENUSAGE_WEB_TOKEN="$TOKEN" \
+  -v openusage-data:/data \
+  openusage-web:local
+```
+
+Open `http://127.0.0.1:8787/app/?access_token=$TOKEN`. Provider API keys can be
+passed as environment variables. Local CLI data and browser cookie stores are
+not visible inside the container unless explicitly mounted.
+
 ## Command-line reports & statusline
 
 Besides the live dashboard, OpenUsage has headless subcommands that reuse the same parsing and pricing — handy for scripts, CI, and quick checks:
@@ -162,6 +192,7 @@ If the question is whether this is the right fit versus a simpler local limits t
 - **36 providers** — coding agents and CLIs (Claude Code, Codex, Cursor, Copilot, Gemini CLI, Antigravity CLI, OpenCode, Amp, Goose, Roo Code, Kilo Code, Kiro, Zed, and more), API platforms (OpenAI, Anthropic, OpenRouter, Groq, Mistral, DeepSeek, Moonshot, Perplexity, xAI, Z.AI, and more), and local runtimes (Ollama)
 - **Zero config** — auto-detects your AI tools and API keys, just run it
 - **Live dashboard** — see spend, quotas, rate limits, tokens, burn rate, and per-model usage at a glance
+- **Local web dashboard** — use a responsive browser UI for the same data, analytics, settings, credentials, and integrations
 - **tmux integration** — show the active tool's usage in your tmux status bar, with provider icons, presets, and active-tool detection
 - **Claude Code statusline** — one-line session cost, today's cost, burn rate, and context usage in Claude Code
 - **Headless reports** — `daily`, `weekly`, `monthly`, `session`, and `blocks` reports in table or JSON

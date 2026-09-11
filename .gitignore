@@ -46,6 +46,8 @@ website/.vite/
 website/dist/
 website/node_modules/
 website/*.tsbuildinfo
+internal/web/static/*
+!internal/web/static/fallback.html
 # Docusaurus docs site
 docs/site/node_modules/
 docs/site/build/

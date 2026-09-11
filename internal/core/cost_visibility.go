@@ -27,31 +27,32 @@ func ResolveHideCosts(snap UsageSnapshot, perAccount *bool, global *bool) bool {
 // dollar amounts are not actually billed to the user; pay-as-you-go and BYOK
 // accounts show costs.
 func autoHideCosts(snap UsageSnapshot) bool {
-	if snap.Raw == nil {
-		return false
+	metaValue := func(key string) string {
+		value, _ := snap.MetaValue(key)
+		return value
 	}
 	switch snap.ProviderID {
 	case "claude_code":
 		// Subscription accounts (Pro/Max) pay a flat rate; the API-derived
 		// cost is informational only and confuses users who do not see those
 		// dollars on their statement.
-		return strings.EqualFold(snap.Raw["subscription"], "active")
+		return strings.EqualFold(metaValue("subscription"), "active")
 	case "codex":
-		plan := strings.ToLower(strings.TrimSpace(snap.Raw["plan_type"]))
+		plan := strings.ToLower(strings.TrimSpace(metaValue("plan_type")))
 		switch plan {
 		case "plus", "pro", "team", "enterprise":
 			return true
 		}
 		return false
 	case "copilot":
-		plan := strings.ToLower(strings.TrimSpace(snap.Raw["copilot_plan"]))
+		plan := strings.ToLower(strings.TrimSpace(metaValue("copilot_plan")))
 		switch plan {
 		case "individual", "business", "enterprise":
 			return true
 		}
 		return false
 	case "zai":
-		plan := strings.ToLower(strings.TrimSpace(snap.Raw["plan_type"]))
+		plan := strings.ToLower(strings.TrimSpace(metaValue("plan_type")))
 		return strings.Contains(plan, "glm_coding_plan")
 	}
 	return false

@@ -3,7 +3,7 @@ title: Architecture
 description: How OpenUsage discovers tools, polls providers via the daemon, and renders snapshots in the TUI.
 ---
 
-OpenUsage is a single Go binary with one runtime: a background daemon that collects data, persists it to SQLite, and serves a unified read model to a thin TUI client. The TUI never talks to provider APIs directly — it always reads from the daemon.
+OpenUsage is a single Go binary with a background daemon that collects data, persists it to SQLite, and serves a unified read model to thin local clients. The terminal UI and optional browser UI never talk to provider APIs directly — they always read from the daemon.
 
 ## Mental model
 
@@ -13,7 +13,7 @@ At the highest level there are five moving parts:
 2. **Providers** — one per AI service, each knows how to fetch a snapshot of usage for an account.
 3. **Daemon** — long-running service that drives the polling loop, accepts hook events from agent integrations, and persists everything to SQLite.
 4. **Snapshots** — a normalized data structure (`UsageSnapshot`) that captures spend, tokens, models, rate limits, and status for one account at one point in time. The daemon's `ReadModel` rebuilds these from stored events on each TUI request.
-5. **TUI** — a Bubble Tea app that connects to the daemon over a Unix domain socket and renders snapshots into tiles, gauges, and detail views.
+5. **Clients** — the Bubble Tea app and optional browser app connect to the daemon over a Unix domain socket and render snapshots into tiles, gauges, charts, and detail views.
 
 ## Dataflow
 
@@ -37,7 +37,12 @@ At the highest level there are five moving parts:
 │   ReadModel (builds      │
 │   UsageSnapshot per      │
 │   provider on request)   │
-└──────────────────────────┘
+└──────────┬───────────────┘
+           │ UDS /v1/read-model
+     ┌─────┴─────────────┐
+     │                   │
+  TUI client        web client
+                     (loopback HTTP)
 ```
 
 Three input sources feed the pipeline:
@@ -83,13 +88,15 @@ type UsageProvider interface {
 | Daemon | Run pipeline, expose UDS endpoints | `internal/daemon/` |
 | Telemetry | Store/query events, build read models | `internal/telemetry/` |
 | TUI | Render snapshots, handle keys | `internal/tui/` |
+| Web | Serve redacted API and browser UI | `internal/web/`, `website/src/dashboard/` |
 
 ## Key invariants
 
 - The TUI never talks to an AI provider directly — only to the daemon over its Unix socket.
+- The browser never talks to an AI provider, SQLite, or the daemon socket directly — it uses the loopback web API.
 - API keys are referenced by env-var name in config (`api_key_env`), never stored.
 - `AccountConfig.Token` has `json:"-"` so runtime tokens never persist.
-- The daemon and the TUI communicate over a Unix domain socket only — no TCP, no remote attach.
+- The daemon and terminal UI communicate over a Unix domain socket. The optional web process adds a separate loopback-only HTTP boundary.
 
 ## Where to read next
 

@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.web packages the local web dashboard and its telemetry daemon.
+# Provider API keys are supplied at runtime; usage history and settings live in
+# the /data volume.
+
+# Build the Vite bundle without the marketing-site prerender step. The web
+# dashboard mounts fresh at /app and only needs the Vite output plus icons.
+FROM node:24-alpine3.22 AS web-builder
+
+WORKDIR /site
+COPY website/package.json website/package-lock.json ./
+RUN npm ci
+COPY website/ ./
+RUN npx vite build
+
+# Build the CGO-enabled Go binary with the web bundle embedded.
+FROM golang:1.26-alpine3.22 AS go-builder
+
+RUN apk add --no-cache gcc musl-dev
+
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=web-builder /site/dist /src/website/dist
+
+RUN mkdir -p internal/web/static \
+    && cp website/dist/index.html internal/web/static/index.html \
+    && rm -rf internal/web/static/assets internal/web/static/brand internal/web/static/icons \
+    && cp -R website/dist/assets internal/web/static/assets \
+    && cp -R website/dist/brand internal/web/static/brand \
+    && cp -R website/dist/icons internal/web/static/icons
+
+ARG VERSION=dev
+ARG COMMIT_HASH=unknown
+ARG BUILD_DATE=unknown
+
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -ldflags "-s -w \
+      -X 'github.com/janekbaraniewski/openusage/internal/version.Version=${VERSION}' \
+      -X 'github.com/janekbaraniewski/openusage/internal/version.CommitHash=${COMMIT_HASH}' \
+      -X 'github.com/janekbaraniewski/openusage/internal/version.BuildDate=${BUILD_DATE}'" \
+    -o /openusage ./cmd/openusage
+
+# Runtime: one small process supervisor starts the daemon and web server.
+FROM alpine:3.22
+
+RUN apk add --no-cache ca-certificates wget \
+    && addgroup -S openusage \
+    && adduser -S -D -h /data -G openusage openusage \
+    && mkdir -p /data/config /data/state /data/home \
+    && chown -R openusage:openusage /data
+
+COPY --from=go-builder /openusage /usr/local/bin/openusage
+COPY docker/web-entrypoint.sh /usr/local/bin/openusage-web-entrypoint
+RUN chmod 0755 /usr/local/bin/openusage-web-entrypoint
+
+ENV HOME=/data/home \
+    XDG_CONFIG_HOME=/data/config \
+    XDG_STATE_HOME=/data/state \
+    OPENUSAGE_WEB_LISTEN=0.0.0.0:8787
+
+VOLUME ["/data"]
+EXPOSE 8787
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=8s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://127.0.0.1:8787/healthz || exit 1
+
+USER openusage:openusage
+ENTRYPOINT ["/usr/local/bin/openusage-web-entrypoint"]

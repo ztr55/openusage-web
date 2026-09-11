@@ -23,6 +23,7 @@ docs/site/.docusaurus
 website/node_modules
 website/build
 website/.docusaurus
+internal/web/static
 
 # Misc large assets that bloat the context.
 screenshots/

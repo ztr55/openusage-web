@@ -25,6 +25,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Install web dependencies
+        run: npm --prefix website ci
+
       - name: Install cross-compilation toolchains
         run: |
           sudo apt-get update
@@ -72,6 +75,12 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+
+      - name: Install web dependencies
+        run: npm --prefix website ci
+
+      - name: Build embedded web assets
+        run: make website-build
 
       - name: Get version from tag
         id: version
