@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/janekbaraniewski/openusage/internal/auth"
 	"github.com/janekbaraniewski/openusage/internal/browsercookies"
 	"github.com/janekbaraniewski/openusage/internal/config"
 	"github.com/janekbaraniewski/openusage/internal/core"
@@ -30,14 +31,16 @@ import (
 )
 
 type Server struct {
-	runtime     *daemon.ViewRuntime
-	socketPath  string
-	staticDir   string
-	allowPublic bool
-	authToken   string
+	runtime       *daemon.ViewRuntime
+	socketPath    string
+	staticDir     string
+	allowPublic   bool
+	authToken     string
+	dashboardPath string
 
 	configLoader             func() (config.Config, error)
 	configSaver              func(config.Config) error
+	configUpdater            func(func(*config.Config) error) error
 	credentialsLoader        func() (config.Credentials, error)
 	discover                 func() detect.Result
 	applyCredentials         func(*detect.Result)
@@ -53,11 +56,16 @@ type Server struct {
 	uninstallIntegration     func(integrations.ID) error
 	saveIntegrationState     func(string, config.IntegrationState) error
 	installDaemon            func() error
+	oauthClient              *auth.OAuthClient
+	saveOAuthCredential      func(string, core.OAuthCredential) error
+	deleteOAuthCredential    func(string) error
 	now                      func() time.Time
 	onReady                  func(string)
 
 	requestToken string
 	controlMu    sync.Mutex
+	oauthMu      sync.Mutex
+	oauthFlows   map[string]*oauthFlow
 }
 
 func NewServer(options Options) (*Server, error) {
@@ -76,6 +84,10 @@ func NewServer(options Options) (*Server, error) {
 			return nil, fmt.Errorf("web static dir is not a directory: %s", staticDir)
 		}
 	}
+	dashboardPath, err := NormalizeDashboardPath(options.DashboardPath)
+	if err != nil {
+		return nil, err
+	}
 
 	s := &Server{
 		runtime:                  options.Runtime,
@@ -83,8 +95,10 @@ func NewServer(options Options) (*Server, error) {
 		staticDir:                staticDir,
 		allowPublic:              options.AllowPublic,
 		authToken:                strings.TrimSpace(options.AuthToken),
+		dashboardPath:            dashboardPath,
 		configLoader:             options.ConfigLoader,
 		configSaver:              options.ConfigSaver,
+		configUpdater:            options.ConfigUpdater,
 		credentialsLoader:        options.CredentialsLoader,
 		discover:                 options.Discover,
 		applyCredentials:         options.ApplyCredentials,
@@ -100,9 +114,13 @@ func NewServer(options Options) (*Server, error) {
 		uninstallIntegration:     options.UninstallIntegration,
 		saveIntegrationState:     options.SaveIntegrationState,
 		installDaemon:            options.InstallDaemon,
+		oauthClient:              options.OAuthClient,
+		saveOAuthCredential:      options.SaveOAuthCredential,
+		deleteOAuthCredential:    options.DeleteOAuthCredential,
 		now:                      options.Now,
 		onReady:                  options.OnReady,
 		requestToken:             token,
+		oauthFlows:               make(map[string]*oauthFlow),
 	}
 
 	if s.configLoader == nil {
@@ -110,6 +128,9 @@ func NewServer(options Options) (*Server, error) {
 	}
 	if s.configSaver == nil {
 		s.configSaver = config.Save
+	}
+	if s.configUpdater == nil && options.ConfigLoader == nil && options.ConfigSaver == nil {
+		s.configUpdater = config.Update
 	}
 	if s.credentialsLoader == nil {
 		s.credentialsLoader = config.LoadCredentials
@@ -177,6 +198,15 @@ func NewServer(options Options) (*Server, error) {
 	}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	if s.oauthClient == nil {
+		s.oauthClient = auth.NewOAuthClient(nil)
+	}
+	if s.saveOAuthCredential == nil {
+		s.saveOAuthCredential = config.SaveOAuthCredential
+	}
+	if s.deleteOAuthCredential == nil {
+		s.deleteOAuthCredential = config.DeleteOAuthCredential
 	}
 	if s.installDaemon == nil {
 		s.installDaemon = func() error {
@@ -250,7 +280,7 @@ func (s *Server) Serve(ctx context.Context, listenAddr string) error {
 	}()
 
 	if s.onReady != nil {
-		s.onReady(serverURL(listener.Addr()))
+		s.onReady(serverURLWithPath(listener.Addr(), s.dashboardPath))
 	}
 
 	serveErr := httpServer.Serve(listener)
@@ -270,15 +300,36 @@ func newRequestToken() (string, error) {
 }
 
 func serverURL(addr net.Addr) string {
+	return serverURLWithPath(addr, "/app/")
+}
+
+func serverURLWithPath(addr net.Addr, dashboardPath string) string {
 	host, port, err := net.SplitHostPort(addr.String())
 	if err != nil {
-		return "http://" + addr.String() + "/app/"
+		return "http://" + addr.String() + dashboardPath
 	}
 	return (&url.URL{
 		Scheme: "http",
 		Host:   net.JoinHostPort(host, port),
-		Path:   "/app/",
+		Path:   dashboardPath,
 	}).String()
+}
+
+// NormalizeDashboardPath returns the trailing-slash URL path used by the web
+// server to open the dashboard. The two supported surfaces are the native
+// /app/ route and the root path used by the dashboard-only container build.
+func NormalizeDashboardPath(value string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "/app/", nil
+	}
+	if value != "/" && value != "/app" && value != "/app/" {
+		return "", fmt.Errorf("web dashboard path must be / or /app/, got %q", value)
+	}
+	if value == "/" {
+		return value, nil
+	}
+	return "/app/", nil
 }
 
 func ValidateListenAddr(listenAddr string) error {
@@ -469,7 +520,9 @@ func (s *Server) authorizeAPIRequest(w http.ResponseWriter, r *http.Request) boo
 		return true
 	}
 
-	provided := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	authorization := strings.TrimSpace(r.Header.Get("Authorization"))
+	provided := strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer "))
+	fromHeader := provided != ""
 	fromQuery := false
 	if provided == "" {
 		if cookie, err := r.Cookie(webAccessTokenCookie); err == nil {
@@ -485,17 +538,21 @@ func (s *Server) authorizeAPIRequest(w http.ResponseWriter, r *http.Request) boo
 		writeJSONError(w, http.StatusUnauthorized, "web access token required")
 		return false
 	}
-	if fromQuery {
-		http.SetCookie(w, &http.Cookie{
-			Name:     webAccessTokenCookie,
-			Value:    s.authToken,
-			Path:     "/",
-			HttpOnly: true,
-			Secure:   r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"),
-			SameSite: http.SameSiteStrictMode,
-		})
+	if fromHeader || fromQuery {
+		s.setAccessTokenCookie(w, r)
 	}
 	return true
+}
+
+func (s *Server) setAccessTokenCookie(w http.ResponseWriter, r *http.Request) {
+	http.SetCookie(w, &http.Cookie{
+		Name:     webAccessTokenCookie,
+		Value:    s.authToken,
+		Path:     "/",
+		HttpOnly: true,
+		Secure:   r.TLS != nil || strings.EqualFold(strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")), "https"),
+		SameSite: http.SameSiteStrictMode,
+	})
 }
 
 func requestHostPort(raw string) (string, string, bool) {

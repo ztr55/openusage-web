@@ -82,8 +82,11 @@ docker run --rm -p 8787:8787 \
   openusage-web:local
 ```
 
-Open `http://127.0.0.1:8787/app/?access_token=$TOKEN`. Provider API keys can be
-passed as environment variables. Local CLI data and browser cookie stores are
+Open `http://127.0.0.1:8787/` and enter `$TOKEN` when the dashboard asks for it.
+Provider API keys can be passed as environment variables. ChatGPT Plus/Pro and
+Claude Pro/Max can be connected directly from Settings without installing their
+CLIs in the container. Existing Claude Code and Codex auth JSON remains available
+as an advanced import fallback. Local CLI history and browser cookie stores are
 not visible inside the container unless explicitly mounted.
 
 ## Command-line reports & statusline

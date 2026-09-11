@@ -229,8 +229,8 @@ func fetchUsageAPIWithAuth(ctx context.Context, url string, setAuth func(*http.R
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("API returned %d: %s", resp.StatusCode, string(body))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+		return nil, &usageAPIHTTPError{StatusCode: resp.StatusCode}
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -246,41 +246,21 @@ func fetchUsageAPIWithAuth(ctx context.Context, url string, setAuth func(*http.R
 	return &usage, nil
 }
 
+type usageAPIHTTPError struct {
+	StatusCode int
+}
+
+func (e *usageAPIHTTPError) Error() string {
+	return fmt.Sprintf("usage API returned HTTP %d", e.StatusCode)
+}
+
+func (e *usageAPIHTTPError) Unwrap() error {
+	if e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden {
+		return errUsageAPIAuth
+	}
+	return nil
+}
+
 // oauthUsageURL is Anthropic's OAuth-scoped usage endpoint. It is a package
 // variable rather than a constant so tests can point it at an httptest server.
 var oauthUsageURL = "https://api.anthropic.com/api/oauth/usage"
-
-// readClaudeCodeOAuthToken loads the Claude Code CLI's OAuth access token from
-// ~/.claude/.credentials.json. It errors if the file is missing, the token is
-// absent, or the token has already expired (Claude Code refreshes it on next
-// use, so a stale value would only produce 401s).
-func readClaudeCodeOAuthToken() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("resolving home directory: %w", err)
-	}
-
-	credsPath := filepath.Join(home, ".claude", ".credentials.json")
-	credsData, err := os.ReadFile(credsPath)
-	if err != nil {
-		return "", fmt.Errorf("reading Claude Code credentials: %w", err)
-	}
-
-	var creds struct {
-		ClaudeAiOauth struct {
-			AccessToken string `json:"accessToken"`
-			ExpiresAt   int64  `json:"expiresAt"`
-		} `json:"claudeAiOauth"`
-	}
-	if err := json.Unmarshal(credsData, &creds); err != nil {
-		return "", fmt.Errorf("parsing Claude Code credentials: %w", err)
-	}
-	token := creds.ClaudeAiOauth.AccessToken
-	if token == "" {
-		return "", fmt.Errorf("no OAuth access token in %s", credsPath)
-	}
-	if exp := creds.ClaudeAiOauth.ExpiresAt; exp > 0 && time.Now().UnixMilli() >= exp {
-		return "", fmt.Errorf("Claude Code OAuth token expired (refreshed on next Claude Code use)")
-	}
-	return token, nil
-}

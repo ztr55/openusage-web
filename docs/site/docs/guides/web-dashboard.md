@@ -34,13 +34,13 @@ docker run --rm \
 Open:
 
 ```text
-http://127.0.0.1:8787/app/?access_token=<TOKEN>
+http://127.0.0.1:8787/
 ```
 
-The dashboard removes the token from the address bar after the first successful
-bootstrap request and keeps it in an HttpOnly cookie. Treat the token like a
-password. Put a TLS reverse proxy in front of the container if it is reachable
-from another machine.
+Enter `<TOKEN>` in the dashboard. The server keeps it in an HttpOnly cookie
+after the first successful request. The token is not placed in the URL or
+browser storage. Treat it like a password. Put a TLS reverse proxy in front of
+the container if it is reachable from another machine.
 
 ## Provider data
 
@@ -63,6 +63,19 @@ and configure the corresponding paths in `/data/config/settings.json`.
 Browser-session authentication needs access to the host browser's cookie store
 and OS secret store. It is not available from the default container. Use the
 native local web command for that workflow.
+
+ChatGPT Plus/Pro and Claude Pro/Max do not need a CLI or mounted credential
+file. In Settings → Credentials → Subscription sign-in:
+
+1. Choose ChatGPT / Codex or Claude Code.
+2. Start authorization and open the provider page.
+3. For ChatGPT, enter the displayed device code; OpenUsage detects approval
+   automatically. For Claude, paste the code shown after approval.
+
+OpenUsage keeps PKCE and device-flow state in server memory and writes only the
+resulting access and refresh tokens to its `credentials.json` file on the
+persistent `/data` volume with `0600` permissions. Existing CLI auth JSON can
+still be imported from the advanced fallback form.
 
 ## Health check
 

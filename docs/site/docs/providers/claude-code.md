@@ -13,7 +13,7 @@ Local-first tracking for the Claude Code CLI. Reads on-disk session logs, billin
 
 - **Provider ID** — `claude_code`
 - **Detection** — `claude` binary on `PATH` plus `~/.claude` (or `~/.config/claude` on Linux)
-- **Auth** — local OAuth in `~/.claude.json`; no API key required
+- **Auth** — direct Claude browser authorization in Web Settings, or local OAuth in `~/.claude/.credentials.json`; no API key required
 - **Type** — coding agent
 - **Tracks**:
   - Daily activity: messages, sessions, tool calls
@@ -25,6 +25,17 @@ Local-first tracking for the Claude Code CLI. Reads on-disk session logs, billin
   - Subscription status
 
 ## Setup
+
+### Claude subscription sign-in
+
+Open Settings → Credentials → Subscription sign-in, choose **Claude Code**, and
+select **Connect Claude**. Approve access on Claude's site, then paste the full
+code shown after approval back into OpenUsage. The PKCE verifier and state stay
+in server memory; OpenUsage stores the resulting access and refresh tokens in
+the local credentials file and refreshes access automatically.
+
+No Claude CLI is required for subscription utilization gauges. Local session
+history still requires mounting or running against the Claude Code data files.
 
 ### Auto-detection
 
@@ -60,10 +71,10 @@ Local data sources, all under `~/.claude/`:
 |---|---|
 | `~/.claude/projects/**/*.jsonl` | Per-conversation transcripts. Authoritative source for tokens, tool calls, billing blocks. |
 | `~/.claude/stats-cache.json` (or `stats.json`) | Daily activity rollups Claude Code computes itself: messages, sessions, tool calls. |
-| `~/.claude.json` | OAuth state, subscription metadata, organization UUID. |
+| `~/.claude.json` | Subscription metadata and organization UUID. |
 | `~/.claude/settings.json` | Active model and `alwaysThinkingEnabled` flag. |
 
-Optional remote source: `GET https://claude.ai/api/organizations/{org_uuid}/usage` — only when [browser-session auth](../daemon/integrations.md) is configured. Provides organization-level rolled-up usage (the same numbers the Anthropic admin console shows).
+Optional remote sources are `GET https://claude.ai/api/organizations/{org_uuid}/usage` with browser-session auth and `GET https://api.anthropic.com/api/oauth/usage` with Claude Code OAuth. The OAuth endpoint is account-scoped and does not require an organization UUID.
 
 ### Pricing tables
 
@@ -149,7 +160,7 @@ Family is matched by substring on the model name (e.g. `claude-3-5-sonnet-…` �
 ### 5h / 7d utilization gauge (`usage_five_hour`, `usage_seven_day`)
 
 - Source (macOS): the Claude **desktop app's** session cookies, decrypted from the macOS keychain, are used to call the usage API above.
-- Source (fallback, all platforms): when desktop-app cookie extraction is unavailable — anywhere but macOS, or when the desktop app isn't installed — the provider reads the Claude Code CLI's own OAuth access token from `~/.claude/.credentials.json` and calls `GET https://api.anthropic.com/api/oauth/usage`. This needs no organization UUID (the token is account-scoped) and no desktop app, so the 5h/7d gauges work on Linux and Windows. An expired token is skipped (Claude Code refreshes it on next use).
+- Source (fallback, all platforms): when desktop-app cookie extraction is unavailable — anywhere but macOS, or when the desktop app isn't installed — the provider reads the Claude Code CLI's own OAuth access token from `~/.claude/.credentials.json` and calls `GET https://api.anthropic.com/api/oauth/usage`. This needs no organization UUID (the token is account-scoped) and no desktop app, so the 5h/7d gauges work on Linux and Windows. OAuth credentials imported through the web settings can refresh through Anthropic's official Claude Code token endpoint. A stale CLI file still requires `claude login` so the CLI can refresh it.
 - Transform: the response (same `five_hour` / `seven_day` utilization shape from either source) populates the gauges and warms the shared 5h cache read by the statusline and tmux segments.
 
 ### Auth status
@@ -172,11 +183,14 @@ Family is matched by substring on the model name (e.g. `claude-3-5-sonnet-…` �
 - `~/.claude/stats-cache.json` (or `stats.json`, with legacy fallbacks) — daily activity rollups
 - `~/.claude.json` — OAuth state, subscription metadata, organization UUID, skill usage
 - `~/.claude/settings.json` — active model, `alwaysThinkingEnabled` flag
+- `~/.claude/.credentials.json` — Claude Code OAuth access and refresh tokens
 
 On Linux the provider also probes `~/.config/claude/projects/` as a fallback.
 
 ## API endpoints used
 
+- Authorization: `GET https://claude.com/cai/oauth/authorize` with PKCE.
+- Token exchange and refresh: `POST https://platform.claude.com/v1/oauth/token`.
 - Optional: `GET https://claude.ai/api/organizations/{org_uuid}/usage` — only when browser-session cookies are imported (macOS desktop app). See [Daemon integrations](../daemon/integrations.md).
 - Optional: `GET https://api.anthropic.com/api/oauth/usage` — off-macOS fallback for the 5h/7d utilization gauge, authenticated with the Claude Code OAuth token from `~/.claude/.credentials.json`.
 

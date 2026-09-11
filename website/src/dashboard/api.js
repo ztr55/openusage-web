@@ -3,6 +3,25 @@ const API_ROOT = "/api/v1";
 let requestToken = "";
 let accessToken = new URLSearchParams(window.location.search).get("access_token") || "";
 
+function stripAccessTokenFromURL() {
+  const url = new URL(window.location.href);
+  if (url.searchParams.has("access_token")) {
+    url.searchParams.delete("access_token");
+    window.history.replaceState({}, "", url);
+  }
+}
+
+if (accessToken) stripAccessTokenFromURL();
+
+export function setAccessToken(value) {
+  accessToken = String(value || "").trim();
+}
+
+export function clearAccessToken() {
+  accessToken = "";
+  stripAccessTokenFromURL();
+}
+
 class APIError extends Error {
   constructor(message, status, payload) {
     super(message);
@@ -31,6 +50,7 @@ async function request(path, options = {}) {
     ...options,
     method,
     headers,
+    credentials: "same-origin",
     cache: "no-store",
   });
 
@@ -51,11 +71,7 @@ async function request(path, options = {}) {
 export async function getBootstrap() {
   const payload = await request("/bootstrap");
   requestToken = payload?.request_token || requestToken;
-  if (accessToken) {
-    const url = new URL(window.location.href);
-    url.searchParams.delete("access_token");
-    window.history.replaceState({}, "", url);
-  }
+  accessToken = "";
   return payload;
 }
 
@@ -80,8 +96,9 @@ export function getIntegrations() {
   return request("/integrations");
 }
 
-function mutate(path, method, value) {
+function mutate(path, method, value, options = {}) {
   return request(path, {
+    ...options,
     method,
     body: value === undefined ? undefined : JSON.stringify(value),
   });
@@ -128,6 +145,30 @@ export function saveCredential(accountID, providerID, apiKey) {
 
 export function deleteCredential(accountID) {
   return mutate(`/accounts/${encodeURIComponent(accountID)}/credential`, "DELETE");
+}
+
+export function saveOAuthCredential(accountID, providerID, credentialsJSON) {
+  return mutate(`/accounts/${encodeURIComponent(accountID)}/oauth`, "PUT", {
+    provider_id: providerID,
+    credentials_json: credentialsJSON,
+  });
+}
+
+export function deleteOAuthCredential(accountID) {
+  return mutate(`/accounts/${encodeURIComponent(accountID)}/oauth`, "DELETE");
+}
+
+export function startOAuthAuthorization(accountID, providerID, signal) {
+  return mutate(`/accounts/${encodeURIComponent(accountID)}/oauth/start`, "POST", {
+    provider_id: providerID,
+  }, { signal });
+}
+
+export function completeOAuthAuthorization(accountID, flowID, authorizationResponse = "", signal) {
+  return mutate(`/accounts/${encodeURIComponent(accountID)}/oauth/complete`, "POST", {
+    flow_id: flowID,
+    authorization_response: authorizationResponse,
+  }, { signal });
 }
 
 export function connectBrowserSession(accountID, providerID, browser) {

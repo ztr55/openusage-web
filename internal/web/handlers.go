@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -438,6 +439,7 @@ func (s *Server) providerDTOs() ([]ProviderDTO, map[string]core.ProviderSpec) {
 			BrowserCookieDomain: strings.TrimSpace(spec.Auth.BrowserCookieDomain),
 			BrowserCookieName:   strings.TrimSpace(spec.Auth.BrowserCookieName),
 			BrowserConsoleURL:   strings.TrimSpace(spec.Auth.BrowserConsoleURL),
+			AuthFileFormat:      strings.TrimSpace(spec.Auth.AuthFileFormat),
 		})
 	}
 	return providers, specs
@@ -497,6 +499,16 @@ func (s *Server) accountDTOs(
 		if entry.account.Token == "" {
 			entry.account.Token = account.Token
 		}
+		if len(account.RuntimeHints) > 0 {
+			if entry.account.RuntimeHints == nil {
+				entry.account.RuntimeHints = make(map[string]string, len(account.RuntimeHints))
+			}
+			for key, value := range account.RuntimeHints {
+				if entry.account.RuntimeHints[key] == "" {
+					entry.account.RuntimeHints[key] = value
+				}
+			}
+		}
 	}
 
 	for _, account := range cfg.Accounts {
@@ -525,6 +537,7 @@ func (s *Server) accountDTOs(
 			envVar = strings.TrimSpace(spec.Auth.APIKeyEnv)
 		}
 		storedKey, stored := credentials.Keys[entry.account.ID]
+		storedOAuth, storedOAuthOK := credentials.OAuth[entry.account.ID]
 		envPresent := envVar != "" && strings.TrimSpace(os.Getenv(envVar)) != ""
 		detectedCredential := strings.TrimSpace(entry.account.Hint("credential_source", "")) != ""
 		present := strings.TrimSpace(entry.account.Token) != "" ||
@@ -542,6 +555,23 @@ func (s *Server) accountDTOs(
 		case present:
 			source = "detected"
 		}
+		expiresAt := ""
+		expired := false
+		refreshable := false
+		if storedOAuthOK && strings.TrimSpace(storedOAuth.AccessToken) != "" {
+			present = true
+			kind = oauthKind(providerID, authType)
+			source = "stored"
+			expiresAt, expired = credentialExpiry(storedOAuth.ExpiresAt, s.nowUTC())
+			refreshExpired := storedOAuth.RefreshTokenExpiresAt > 0 && s.nowUTC().UnixMilli() >= storedOAuth.RefreshTokenExpiresAt
+			expired = expired || refreshExpired
+			refreshable = strings.TrimSpace(storedOAuth.RefreshToken) != "" && !refreshExpired
+		} else if detectedCredential {
+			source = safeCredentialSource(providerID, entry.account.Hint("credential_source", ""))
+			kind = oauthKind(providerID, authType)
+			expiresAt, expired = credentialExpiryHint(entry.account.Hint("credential_expires_at", ""), s.nowUTC())
+			refreshable = entry.account.Hint("credential_refreshable", "") == "true"
+		}
 
 		session := browserSessionDTO(entry.account, credentials.Sessions[entry.account.ID], credentials.Sessions != nil, s.nowUTC())
 		if session.Connected && !present && authType == string(core.ProviderAuthTypeBrowserSession) {
@@ -556,10 +586,13 @@ func (s *Server) accountDTOs(
 			Configured: entry.configured,
 			Discovered: entry.discovered,
 			Credential: CredentialStatusDTO{
-				Present: present,
-				Kind:    kind,
-				Source:  source,
-				EnvVar:  envVar,
+				Present:     present,
+				Kind:        kind,
+				Source:      source,
+				EnvVar:      envVar,
+				ExpiresAt:   expiresAt,
+				Expired:     expired,
+				Refreshable: refreshable,
 			},
 			BrowserSession: session,
 		})
@@ -571,6 +604,54 @@ func (s *Server) accountDTOs(
 		return out[i].ID < out[j].ID
 	})
 	return out
+}
+
+func oauthKind(providerID, fallback string) string {
+	switch providerID {
+	case "codex", "claude_code":
+		return string(core.ProviderAuthTypeOAuth)
+	default:
+		return fallback
+	}
+}
+
+func credentialExpiry(expiresAt int64, now time.Time) (string, bool) {
+	if expiresAt <= 0 {
+		return "", false
+	}
+	expires := time.UnixMilli(expiresAt).UTC()
+	return expires.Format(time.RFC3339), !now.Before(expires)
+}
+
+func credentialExpiryHint(value string, now time.Time) (string, bool) {
+	expiresAt, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
+	if err != nil {
+		return "", false
+	}
+	return credentialExpiry(expiresAt, now)
+}
+
+func safeCredentialSource(providerID, source string) string {
+	source = strings.ToLower(strings.TrimSpace(source))
+	switch {
+	case strings.HasPrefix(source, "file:"):
+		switch providerID {
+		case "claude_code":
+			return "Claude Code file"
+		case "codex":
+			return "Codex auth file"
+		default:
+			return "local file"
+		}
+	case strings.HasPrefix(source, "keychain:"):
+		return "macOS keychain"
+	case source == "stored":
+		return "stored"
+	case source != "":
+		return "detected"
+	default:
+		return ""
+	}
 }
 
 func browserSessionDTO(account core.AccountConfig, session config.BrowserSession, hasStored bool, now time.Time) BrowserSessionDTO {

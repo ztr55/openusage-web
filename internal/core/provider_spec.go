@@ -62,6 +62,10 @@ type ProviderAuthSpec struct {
 	// browser when they click "Connect via browser" for this provider.
 	// Optional — falls back to "https://" + BrowserCookieDomain if empty.
 	BrowserConsoleURL string
+
+	// AuthFileFormat identifies a provider-owned local credential JSON format
+	// that the web settings UI may safely import. Empty means no import form.
+	AuthFileFormat string
 }
 
 // SupportsAuth reports whether the provider's auth spec accepts the given

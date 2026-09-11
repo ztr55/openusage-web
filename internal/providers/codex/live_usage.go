@@ -15,55 +15,68 @@ import (
 
 	"github.com/janekbaraniewski/openusage/internal/core"
 	"github.com/janekbaraniewski/openusage/internal/providers/shared"
+	"github.com/janekbaraniewski/openusage/internal/version"
 )
 
 func (p *Provider) fetchLiveUsage(ctx context.Context, acct core.AccountConfig, configDir string, snap *core.UsageSnapshot) (bool, error) {
-	authPath := filepath.Join(configDir, "auth.json")
-	if override := acct.Hint("auth_file", ""); override != "" {
-		authPath = override
+	accessToken := ""
+	accountID := ""
+	var oauthCredential *core.OAuthCredential
+	if acct.OAuth != nil && strings.TrimSpace(acct.OAuth.AccessToken) != "" {
+		credential, err := p.resolveOAuthCredential(ctx, acct)
+		if err != nil {
+			return false, err
+		}
+		accessToken = strings.TrimSpace(credential.AccessToken)
+		accountID = core.FirstNonEmpty(credential.ProviderAccountID, acct.Hint("account_id", ""))
+		oauthCredential = &credential
+	} else {
+		authPath := filepath.Join(configDir, "auth.json")
+		if override := acct.Hint("auth_file", ""); override != "" {
+			authPath = override
+		}
+
+		data, err := os.ReadFile(authPath)
+		if err != nil {
+			return false, nil
+		}
+
+		var auth authFile
+		if err := json.Unmarshal(data, &auth); err != nil {
+			return false, nil
+		}
+
+		accessToken = strings.TrimSpace(auth.Tokens.AccessToken)
+		accountID = core.FirstNonEmpty(auth.Tokens.AccountID, auth.AccountID)
 	}
 
-	data, err := os.ReadFile(authPath)
-	if err != nil {
-		return false, nil
-	}
-
-	var auth authFile
-	if err := json.Unmarshal(data, &auth); err != nil {
-		return false, nil
-	}
-
-	if strings.TrimSpace(auth.Tokens.AccessToken) == "" {
+	if accessToken == "" {
 		return false, nil
 	}
 
 	baseURL := resolveChatGPTBaseURL(acct, configDir)
 	usageURL := usageURLForBase(baseURL)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL, nil)
-	if err != nil {
-		return false, fmt.Errorf("codex: creating live usage request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+auth.Tokens.AccessToken)
-	req.Header.Set("Accept", "application/json")
-
-	accountID := core.FirstNonEmpty(auth.Tokens.AccountID, auth.AccountID)
 	if accountID == "" {
 		accountID = acct.Hint("account_id", "")
 	}
-	if accountID != "" {
-		req.Header.Set("ChatGPT-Account-Id", accountID)
-	}
 
-	if cliVersion := snap.Raw["cli_version"]; cliVersion != "" {
-		req.Header.Set("User-Agent", "codex-cli/"+cliVersion)
-	} else {
-		req.Header.Set("User-Agent", "codex-cli")
-	}
-
-	resp, err := p.Client().Do(req)
+	resp, err := p.requestLiveUsage(ctx, usageURL, accessToken, accountID, acct.OAuth != nil, snap.Raw["cli_version"])
 	if err != nil {
 		return false, fmt.Errorf("codex: live usage request failed: %w", err)
+	}
+	if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && oauthCredential != nil && oauthCredential.AccessToken == acct.OAuth.AccessToken && strings.TrimSpace(oauthCredential.RefreshToken) != "" {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+		_ = resp.Body.Close()
+		refreshed, refreshErr := p.refreshOAuthCredential(ctx, acct, *oauthCredential)
+		if refreshErr != nil {
+			return false, refreshErr
+		}
+		accountID = core.FirstNonEmpty(refreshed.ProviderAccountID, accountID)
+		resp, err = p.requestLiveUsage(ctx, usageURL, refreshed.AccessToken, accountID, true, "")
+		if err != nil {
+			return false, fmt.Errorf("codex: live usage retry failed: %w", err)
+		}
 	}
 	defer resp.Body.Close()
 
@@ -90,6 +103,31 @@ func (p *Provider) fetchLiveUsage(ctx context.Context, acct core.AccountConfig, 
 	}
 	snap.Raw["quota_api"] = "live"
 	return true, nil
+}
+
+func (p *Provider) requestLiveUsage(ctx context.Context, usageURL, accessToken, accountID string, oauth bool, cliVersion string) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, usageURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/json")
+	if accountID != "" {
+		req.Header.Set("ChatGPT-Account-Id", accountID)
+	}
+	if oauth {
+		userAgent := "openusage"
+		if release := strings.TrimSpace(version.Version); release != "" {
+			userAgent += "/" + release
+		}
+		req.Header.Set("User-Agent", userAgent)
+		req.Header.Set("Originator", "openusage")
+	} else if cliVersion != "" {
+		req.Header.Set("User-Agent", "codex-cli/"+cliVersion)
+	} else {
+		req.Header.Set("User-Agent", "codex-cli")
+	}
+	return p.Client().Do(req)
 }
 
 func applyUsagePayload(payload *usagePayload, snap *core.UsageSnapshot) usageApplySummary {

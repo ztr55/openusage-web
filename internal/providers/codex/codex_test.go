@@ -2,15 +2,19 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/janekbaraniewski/openusage/internal/auth"
+	"github.com/janekbaraniewski/openusage/internal/config"
 	"github.com/janekbaraniewski/openusage/internal/core"
 )
 
@@ -24,8 +28,8 @@ func TestProviderID(t *testing.T) {
 func TestDescribe(t *testing.T) {
 	p := New()
 	info := p.Describe()
-	if info.Name != "OpenAI Codex CLI" {
-		t.Errorf("expected name 'OpenAI Codex CLI', got %q", info.Name)
+	if info.Name != "ChatGPT / Codex" {
+		t.Errorf("expected name 'ChatGPT / Codex', got %q", info.Name)
 	}
 	if len(info.Capabilities) == 0 {
 		t.Error("expected at least one capability")
@@ -452,6 +456,113 @@ func TestFetchUsesLiveUsageEndpoint(t *testing.T) {
 	}
 	if snap.Raw["credit_balance"] != "$9.99" {
 		t.Fatalf("credit_balance = %q, want $9.99", snap.Raw["credit_balance"])
+	}
+}
+
+func TestFetchUsesImportedOAuthWithoutAuthFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/backend-api/wham/usage" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.Header.Get("Authorization"); got != "Bearer imported-codex-token" {
+			t.Fatalf("Authorization header = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"rate_limit":{"primary":{"used_percent":12,"window_minutes":300,"resets_at":1770700000}}}`))
+	}))
+	defer server.Close()
+
+	snap, err := New().Fetch(context.Background(), core.AccountConfig{
+		ID:       "codex-cli",
+		Provider: "codex",
+		Auth:     "token",
+		OAuth:    &core.OAuthCredential{AccessToken: "imported-codex-token"},
+		RuntimeHints: map[string]string{
+			"config_dir":       tmpDir,
+			"sessions_dir":     filepath.Join(tmpDir, "sessions"),
+			"chatgpt_base_url": server.URL + "/backend-api",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Fetch() error: %v", err)
+	}
+	if snap.Status != core.StatusOK || metricUsed(t, snap, "rate_limit_primary") != 12 {
+		t.Fatalf("snapshot = %#v", snap)
+	}
+}
+
+func TestFetchRefreshesOAuthAfterUnauthorizedAndPersistsRotation(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	tmpDir := t.TempDir()
+	var usageCalls atomic.Int32
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/oauth/token":
+			var body map[string]string
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatal(err)
+			}
+			if r.Header.Get("Content-Type") != "application/json" || body["refresh_token"] != "old-refresh" {
+				t.Fatalf("refresh request = %#v body=%#v", r.Header, body)
+			}
+			_, _ = w.Write([]byte(`{"access_token":"fresh-access","refresh_token":"rotated-refresh","expires_in":3600}`))
+		case "/backend-api/wham/usage":
+			if usageCalls.Add(1) == 1 {
+				if r.Header.Get("Authorization") != "Bearer current-access" {
+					t.Fatalf("initial usage authorization = %q", r.Header.Get("Authorization"))
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if r.Header.Get("Authorization") != "Bearer fresh-access" || r.Header.Get("ChatGPT-Account-Id") != "chatgpt-account" {
+				t.Fatalf("usage auth headers = %#v", r.Header)
+			}
+			if r.Header.Get("Originator") != "openusage" || !strings.HasPrefix(r.Header.Get("User-Agent"), "openusage/") {
+				t.Fatalf("usage client headers = %#v", r.Header)
+			}
+			_, _ = w.Write([]byte(`{"rate_limit":{"primary":{"used_percent":17,"window_minutes":300}}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	provider := New()
+	provider.HTTPClient = server.Client()
+	provider.oauthClient = auth.NewOAuthClient(server.Client())
+	provider.oauthClient.CodexBaseURL = server.URL
+	account := core.AccountConfig{
+		ID:       "codex-cli",
+		Provider: "codex",
+		Auth:     "oauth",
+		BaseURL:  server.URL + "/backend-api",
+		OAuth: &core.OAuthCredential{
+			AccessToken:       "current-access",
+			RefreshToken:      "old-refresh",
+			ProviderAccountID: "chatgpt-account",
+			ExpiresAt:         time.Now().Add(time.Hour).UnixMilli(),
+		},
+		RuntimeHints: map[string]string{
+			"config_dir":   tmpDir,
+			"sessions_dir": filepath.Join(tmpDir, "sessions"),
+		},
+	}
+	if err := config.SaveOAuthCredential(account.ID, *account.OAuth); err != nil {
+		t.Fatalf("seed OAuth credential: %v", err)
+	}
+	snapshot, err := provider.Fetch(context.Background(), account)
+	if err != nil {
+		t.Fatalf("Fetch: %v", err)
+	}
+	if snapshot.Status != core.StatusOK || metricUsed(t, snapshot, "rate_limit_primary") != 17 {
+		t.Fatalf("snapshot = %#v", snapshot)
+	}
+	stored, ok, err := config.LoadOAuthCredential("codex-cli")
+	if err != nil || !ok || stored.AccessToken != "fresh-access" || stored.RefreshToken != "rotated-refresh" || stored.ProviderAccountID != "chatgpt-account" {
+		t.Fatalf("stored credential = %#v, found=%v err=%v", stored, ok, err)
 	}
 }
 

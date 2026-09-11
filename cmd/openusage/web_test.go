@@ -12,7 +12,7 @@ func TestNewWebCommandFlags(t *testing.T) {
 		t.Fatalf("Use = %q, want web", cmd.Use)
 	}
 
-	for _, name := range []string{"listen", "static-dir", "no-open"} {
+	for _, name := range []string{"listen", "static-dir", "dashboard-path", "no-open"} {
 		if cmd.Flags().Lookup(name) == nil {
 			t.Fatalf("web command missing %q flag", name)
 		}
@@ -20,6 +20,10 @@ func TestNewWebCommandFlags(t *testing.T) {
 	listen, err := cmd.Flags().GetString("listen")
 	if err != nil || listen != defaultWebListenAddr {
 		t.Fatalf("listen default = %q, want %q", listen, defaultWebListenAddr)
+	}
+	dashboardPath, err := cmd.Flags().GetString("dashboard-path")
+	if err != nil || dashboardPath != defaultWebDashboardPath {
+		t.Fatalf("dashboard path default = %q, want %q", dashboardPath, defaultWebDashboardPath)
 	}
 }
 
@@ -29,8 +33,9 @@ func TestOpenWebURLRejectsUnsafeURLs(t *testing.T) {
 		"http://example.com:8787/app/",
 		"http://127.0.0.1:8787/other",
 		"http://127.0.0.1:8787/app/?open=1",
+		"http://127.0.0.1:8787/app/?access_token=secret",
 	} {
-		if err := openWebURL(rawURL, false); err == nil {
+		if err := openWebURL(rawURL, false, defaultWebDashboardPath); err == nil {
 			t.Fatalf("openWebURL(%q) unexpectedly succeeded", rawURL)
 		}
 	}

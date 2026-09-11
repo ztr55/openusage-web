@@ -219,6 +219,17 @@ func TestUsageAuthSources_NamesAndOrder(t *testing.T) {
 	}
 }
 
+func TestUsageAuthSources_ExplicitOAuthSkipsMachineCookie(t *testing.T) {
+	sources := New().usageAuthSources("machine-org", core.AccountConfig{
+		ID:    "subscription-account",
+		Auth:  "oauth",
+		OAuth: &core.OAuthCredential{AccessToken: "account-access"},
+	})
+	if len(sources) != 1 || sources[0].name != "oauth" {
+		t.Fatalf("explicit OAuth sources = %#v, want OAuth only", sources)
+	}
+}
+
 // TestUsageAuthSources_OAuthPrepare_UsesOAuthSchemeAndURL exercises the real
 // "oauth" fixture's prepare() end to end: it should resolve to oauthUsageURL
 // and a setAuth closure using the bearer scheme, never the cookie scheme.
@@ -233,7 +244,7 @@ func TestUsageAuthSources_OAuthPrepare_UsesOAuthSchemeAndURL(t *testing.T) {
 		t.Fatal(`findUsageAuthSource(sources, "oauth") = false`)
 	}
 
-	url, setAuth, err := src.prepare()
+	url, setAuth, err := src.prepare(context.Background())
 	if err != nil {
 		t.Fatalf("prepare: unexpected error: %v", err)
 	}
@@ -297,7 +308,7 @@ func TestReadUsageAPI_PinsSuccessfulAuthSource(t *testing.T) {
 	if err := p.readUsageAPI(context.Background(), "org-uuid", &snap); err != nil {
 		t.Fatalf("first call: unexpected error: %v", err)
 	}
-	if got := p.getLastUsageAuthSource(); got != "oauth" {
+	if got := p.getLastUsageAuthSource(""); got != "oauth" {
 		t.Fatalf("pinned source after first success = %q, want %q", got, "oauth")
 	}
 	if oauthCalls != 1 {
@@ -308,7 +319,7 @@ func TestReadUsageAPI_PinsSuccessfulAuthSource(t *testing.T) {
 	if err := p.readUsageAPI(context.Background(), "org-uuid", &snap2); err != nil {
 		t.Fatalf("second call: unexpected error: %v", err)
 	}
-	if got := p.getLastUsageAuthSource(); got != "oauth" {
+	if got := p.getLastUsageAuthSource(""); got != "oauth" {
 		t.Fatalf("pinned source after second success = %q, want %q", got, "oauth")
 	}
 	if oauthCalls != 2 {
@@ -326,10 +337,23 @@ func TestReadUsageAPI_PinsSuccessfulAuthSource(t *testing.T) {
 	if snap3.Raw["usage_api_cached"] != "true" {
 		t.Fatalf("third call: expected cached fallback, got Raw=%v", snap3.Raw)
 	}
-	if got := p.getLastUsageAuthSource(); got != "" {
+	if got := p.getLastUsageAuthSource(""); got != "" {
 		t.Fatalf("pin should clear once the pinned source fails, got %q", got)
 	}
 	if oauthCalls != 2 {
 		t.Fatalf("oauth server calls after credential removal = %d, want still 2 (prepare should fail before any request)", oauthCalls)
+	}
+}
+
+func TestUsageAPICacheIsIsolatedByAccount(t *testing.T) {
+	p := New()
+	p.setCachedUsage("account-a", &usageResponse{FiveHour: &usageBucket{Utilization: 42}})
+
+	snapshot := core.NewUsageSnapshot("claude_code", "account-b")
+	if p.applyCachedUsage(&snapshot, "account-b") {
+		t.Fatal("account B received account A's cached usage")
+	}
+	if p.getCachedUsage("account-a") == nil {
+		t.Fatal("account A's cached usage was not retained")
 	}
 }

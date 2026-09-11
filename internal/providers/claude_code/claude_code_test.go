@@ -43,11 +43,23 @@ func TestProvider_ID(t *testing.T) {
 func TestProvider_Describe(t *testing.T) {
 	p := New()
 	info := p.Describe()
-	if info.Name != "Claude Code CLI" {
-		t.Errorf("Expected name 'Claude Code CLI', got %q", info.Name)
+	if info.Name != "Claude / Claude Code" {
+		t.Errorf("Expected name 'Claude / Claude Code', got %q", info.Name)
 	}
 	if len(info.Capabilities) == 0 {
 		t.Error("Expected non-empty capabilities")
+	}
+}
+
+func TestHasChangedAlwaysPollsOAuthAccounts(t *testing.T) {
+	changed, err := New().HasChanged(core.AccountConfig{
+		OAuth: &core.OAuthCredential{AccessToken: "oauth-access"},
+	}, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("HasChanged: %v", err)
+	}
+	if !changed {
+		t.Fatal("OAuth account should poll remote usage without local file changes")
 	}
 }
 

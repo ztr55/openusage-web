@@ -7,11 +7,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/janekbaraniewski/openusage/internal/core"
 )
 
 type Credentials struct {
-	Keys     map[string]string         `json:"keys"`               // account ID → API key
-	Sessions map[string]BrowserSession `json:"sessions,omitempty"` // account ID → browser-session credential
+	Keys     map[string]string               `json:"keys"`               // account ID → API key
+	Sessions map[string]BrowserSession       `json:"sessions,omitempty"` // account ID → browser-session credential
+	OAuth    map[string]core.OAuthCredential `json:"oauth,omitempty"`    // account ID → provider OAuth login
 }
 
 // BrowserSession stores a single account's browser-session credential. Used
@@ -55,7 +58,7 @@ func LoadCredentials() (Credentials, error) {
 }
 
 func LoadCredentialsFrom(path string) (Credentials, error) {
-	creds := Credentials{Keys: make(map[string]string)}
+	creds := emptyCredentials()
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -66,7 +69,7 @@ func LoadCredentialsFrom(path string) (Credentials, error) {
 	}
 
 	if err := json.Unmarshal(data, &creds); err != nil {
-		return Credentials{Keys: make(map[string]string)}, fmt.Errorf("parsing credentials %s: %w", path, err)
+		return emptyCredentials(), fmt.Errorf("parsing credentials %s: %w", path, err)
 	}
 
 	if creds.Keys == nil {
@@ -74,6 +77,9 @@ func LoadCredentialsFrom(path string) (Credentials, error) {
 	}
 	if creds.Sessions == nil {
 		creds.Sessions = make(map[string]BrowserSession)
+	}
+	if creds.OAuth == nil {
+		creds.OAuth = make(map[string]core.OAuthCredential)
 	}
 	if len(creds.Keys) > 0 {
 		normalized := make(map[string]string, len(creds.Keys))
@@ -101,6 +107,25 @@ func LoadCredentialsFrom(path string) (Credentials, error) {
 		}
 		creds.Sessions = normalized
 	}
+	if len(creds.OAuth) > 0 {
+		normalized := make(map[string]core.OAuthCredential, len(creds.OAuth))
+		for accountID, credential := range creds.OAuth {
+			id := normalizeAccountID(accountID)
+			if id == "" {
+				continue
+			}
+			credential.AccessToken = strings.TrimSpace(credential.AccessToken)
+			credential.RefreshToken = strings.TrimSpace(credential.RefreshToken)
+			credential.ProviderAccountID = strings.TrimSpace(credential.ProviderAccountID)
+			if credential.AccessToken == "" {
+				continue
+			}
+			if _, exists := normalized[id]; !exists || accountID == id {
+				normalized[id] = credential
+			}
+		}
+		creds.OAuth = normalized
+	}
 
 	return creds, nil
 }
@@ -120,17 +145,9 @@ func SaveCredentialTo(path, accountID, apiKey string) error {
 		return fmt.Errorf("api key is empty")
 	}
 
-	credMu.Lock()
-	defer credMu.Unlock()
-
-	creds, err := LoadCredentialsFrom(path)
-	if err != nil {
-		creds = Credentials{Keys: make(map[string]string)}
-	}
-
-	creds.Keys[accountID] = apiKey
-
-	return writeCredentials(path, creds)
+	return updateCredentials(path, func(creds *Credentials) {
+		creds.Keys[accountID] = apiKey
+	})
 }
 
 func DeleteCredential(accountID string) error {
@@ -143,17 +160,111 @@ func DeleteCredentialFrom(path, accountID string) error {
 		return fmt.Errorf("account ID is empty")
 	}
 
-	credMu.Lock()
-	defer credMu.Unlock()
+	return updateCredentials(path, func(creds *Credentials) {
+		delete(creds.Keys, accountID)
+	})
+}
 
-	creds, err := LoadCredentialsFrom(path)
-	if err != nil {
-		return err
+// SaveOAuthCredential persists the minimum token set needed by a provider's
+// runtime OAuth path. Imported CLI auth files are never stored verbatim.
+func SaveOAuthCredential(accountID string, credential core.OAuthCredential) error {
+	return SaveOAuthCredentialTo(CredentialsPath(), accountID, credential)
+}
+
+func SaveOAuthCredentialTo(path, accountID string, credential core.OAuthCredential) error {
+	accountID = normalizeAccountID(accountID)
+	if accountID == "" {
+		return fmt.Errorf("account ID is empty")
+	}
+	credential.AccessToken = strings.TrimSpace(credential.AccessToken)
+	credential.RefreshToken = strings.TrimSpace(credential.RefreshToken)
+	credential.ProviderAccountID = strings.TrimSpace(credential.ProviderAccountID)
+	if credential.AccessToken == "" {
+		return fmt.Errorf("access token is empty")
 	}
 
-	delete(creds.Keys, accountID)
+	return updateCredentials(path, func(creds *Credentials) {
+		creds.OAuth[accountID] = credential
+	})
+}
 
-	return writeCredentials(path, creds)
+// DeleteOAuthCredential removes an imported OAuth credential while leaving API
+// keys, browser sessions, and the account configuration untouched.
+func DeleteOAuthCredential(accountID string) error {
+	return DeleteOAuthCredentialFrom(CredentialsPath(), accountID)
+}
+
+func DeleteOAuthCredentialFrom(path, accountID string) error {
+	accountID = normalizeAccountID(accountID)
+	if accountID == "" {
+		return fmt.Errorf("account ID is empty")
+	}
+
+	return updateCredentials(path, func(creds *Credentials) {
+		delete(creds.OAuth, accountID)
+	})
+}
+
+func LoadOAuthCredential(accountID string) (core.OAuthCredential, bool, error) {
+	return LoadOAuthCredentialFrom(CredentialsPath(), accountID)
+}
+
+func LoadOAuthCredentialFrom(path, accountID string) (core.OAuthCredential, bool, error) {
+	accountID = normalizeAccountID(accountID)
+	if accountID == "" {
+		return core.OAuthCredential{}, false, fmt.Errorf("account ID is empty")
+	}
+	creds, err := LoadCredentialsFrom(path)
+	if err != nil {
+		return core.OAuthCredential{}, false, err
+	}
+	credential, ok := creds.OAuth[accountID]
+	return credential, ok, nil
+}
+
+// RefreshOAuthCredential serializes a rotating-token exchange across processes.
+// The refresh callback runs only if the stored credential still matches the
+// caller's copy, and it runs while the credentials lock is held.
+func RefreshOAuthCredential(accountID string, previous core.OAuthCredential, refresh func(core.OAuthCredential) (core.OAuthCredential, error)) (core.OAuthCredential, bool, error) {
+	return RefreshOAuthCredentialFrom(CredentialsPath(), accountID, previous, refresh)
+}
+
+func RefreshOAuthCredentialFrom(path, accountID string, previous core.OAuthCredential, refresh func(core.OAuthCredential) (core.OAuthCredential, error)) (core.OAuthCredential, bool, error) {
+	accountID = normalizeAccountID(accountID)
+	if accountID == "" {
+		return core.OAuthCredential{}, false, fmt.Errorf("account ID is empty")
+	}
+	if refresh == nil {
+		return core.OAuthCredential{}, false, fmt.Errorf("refresh callback is nil")
+	}
+
+	var result core.OAuthCredential
+	refreshed := false
+	err := withLockedCredentials(path, func(creds *Credentials) error {
+		current, ok := creds.OAuth[accountID]
+		if !ok {
+			return nil
+		}
+		result = current
+		if current.AccessToken != previous.AccessToken || current.RefreshToken != previous.RefreshToken {
+			return nil
+		}
+		replacement, err := refresh(current)
+		if err != nil {
+			return err
+		}
+		replacement.AccessToken = strings.TrimSpace(replacement.AccessToken)
+		replacement.RefreshToken = strings.TrimSpace(replacement.RefreshToken)
+		replacement.ProviderAccountID = strings.TrimSpace(replacement.ProviderAccountID)
+		if replacement.AccessToken == "" {
+			return fmt.Errorf("access token is empty")
+		}
+		creds.OAuth[accountID] = replacement
+		result = replacement
+		refreshed = true
+		return nil
+	})
+	return result, refreshed, err
 }
 
 // SaveSession persists a browser-session credential under the given account.
@@ -176,18 +287,9 @@ func SaveSessionTo(path, accountID string, session BrowserSession) error {
 		return fmt.Errorf("session domain and cookie_name are required")
 	}
 
-	credMu.Lock()
-	defer credMu.Unlock()
-
-	creds, err := LoadCredentialsFrom(path)
-	if err != nil {
-		creds = Credentials{Keys: make(map[string]string), Sessions: make(map[string]BrowserSession)}
-	}
-	if creds.Sessions == nil {
-		creds.Sessions = make(map[string]BrowserSession)
-	}
-	creds.Sessions[accountID] = session
-	return writeCredentials(path, creds)
+	return updateCredentials(path, func(creds *Credentials) {
+		creds.Sessions[accountID] = session
+	})
 }
 
 // DeleteSession removes a browser-session credential. Safe to call when no
@@ -202,15 +304,9 @@ func DeleteSessionFrom(path, accountID string) error {
 		return fmt.Errorf("account ID is empty")
 	}
 
-	credMu.Lock()
-	defer credMu.Unlock()
-
-	creds, err := LoadCredentialsFrom(path)
-	if err != nil {
-		return err
-	}
-	delete(creds.Sessions, accountID)
-	return writeCredentials(path, creds)
+	return updateCredentials(path, func(creds *Credentials) {
+		delete(creds.Sessions, accountID)
+	})
 }
 
 // LoadSession returns the stored browser-session credential for an account
@@ -245,12 +341,64 @@ func writeCredentials(path string, creds Credentials) error {
 	}
 	data = append(data, '\n')
 
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	temporary, err := os.CreateTemp(dir, ".credentials-*.tmp")
+	if err != nil {
+		return fmt.Errorf("creating temporary credentials file: %w", err)
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if err := temporary.Chmod(0o600); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("setting temporary credentials permissions: %w", err)
+	}
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
 		return fmt.Errorf("writing credentials: %w", err)
 	}
-	// Enforce permissions even if the file pre-existed with wrong mode.
-	if err := os.Chmod(path, 0o600); err != nil {
-		return fmt.Errorf("setting credentials permissions: %w", err)
+	if err := temporary.Sync(); err != nil {
+		_ = temporary.Close()
+		return fmt.Errorf("syncing credentials: %w", err)
+	}
+	if err := temporary.Close(); err != nil {
+		return fmt.Errorf("closing credentials: %w", err)
+	}
+	if err := os.Rename(temporaryPath, path); err != nil {
+		return fmt.Errorf("replacing credentials: %w", err)
 	}
 	return nil
+}
+
+func updateCredentials(path string, update func(*Credentials)) error {
+	return withLockedCredentials(path, func(creds *Credentials) error {
+		update(creds)
+		return nil
+	})
+}
+
+func withLockedCredentials(path string, update func(*Credentials) error) error {
+	credMu.Lock()
+	defer credMu.Unlock()
+
+	unlock, err := lockFile(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	creds, err := LoadCredentialsFrom(path)
+	if err != nil {
+		return err
+	}
+	if err := update(&creds); err != nil {
+		return err
+	}
+	return writeCredentials(path, creds)
+}
+
+func emptyCredentials() Credentials {
+	return Credentials{
+		Keys:     make(map[string]string),
+		Sessions: make(map[string]BrowserSession),
+		OAuth:    make(map[string]core.OAuthCredential),
+	}
 }

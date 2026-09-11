@@ -7,6 +7,22 @@ import (
 	"time"
 )
 
+// OAuthCredential is the runtime representation of a provider login.
+// ExpiresAt values are Unix milliseconds, matching Claude Code's credential
+// file; Codex JWT expiry values are normalized to the same unit.
+type OAuthCredential struct {
+	AccessToken           string `json:"access_token"`
+	RefreshToken          string `json:"refresh_token,omitempty"`
+	ProviderAccountID     string `json:"provider_account_id,omitempty"`
+	ExpiresAt             int64  `json:"expires_at,omitempty"`
+	RefreshTokenExpiresAt int64  `json:"refresh_token_expires_at,omitempty"`
+}
+
+// IsExpired reports whether the access-token expiry has passed when known.
+func (c OAuthCredential) IsExpired(now time.Time) bool {
+	return c.ExpiresAt > 0 && now.UnixMilli() >= c.ExpiresAt
+}
+
 type AccountConfig struct {
 	ID         string `json:"id"`
 	Provider   string `json:"provider"`
@@ -41,6 +57,7 @@ type AccountConfig struct {
 	Paths map[string]string `json:"paths,omitempty"`
 
 	Token        string            `json:"-"` // runtime-only: access token (never persisted)
+	OAuth        *OAuthCredential  `json:"-"` // runtime-only: provider OAuth credential
 	RuntimeHints map[string]string `json:"-"` // runtime-only: detection metadata + local hints (never persisted)
 }
 

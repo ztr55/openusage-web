@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/janekbaraniewski/openusage/internal/auth"
 	"github.com/janekbaraniewski/openusage/internal/config"
 	"github.com/janekbaraniewski/openusage/internal/core"
 	"github.com/janekbaraniewski/openusage/internal/integrations"
@@ -108,6 +109,20 @@ type sectionPatch struct {
 type credentialPatch struct {
 	ProviderID string `json:"provider_id"`
 	APIKey     string `json:"api_key"`
+}
+
+type oauthCredentialPatch struct {
+	ProviderID      string `json:"provider_id"`
+	CredentialsJSON string `json:"credentials_json"`
+}
+
+type oauthStartPatch struct {
+	ProviderID string `json:"provider_id"`
+}
+
+type oauthCompletePatch struct {
+	FlowID                string `json:"flow_id"`
+	AuthorizationResponse string `json:"authorization_response"`
 }
 
 type browserSessionPatch struct {
@@ -590,6 +605,31 @@ func (s *Server) serveAccountAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if accountID, ok := resourceID(r.URL.Path, "/api/v1/accounts/", "/oauth/start"); ok {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		s.handleOAuthStart(w, r, accountID)
+		return
+	}
+	if accountID, ok := resourceID(r.URL.Path, "/api/v1/accounts/", "/oauth/complete"); ok {
+		if !allowMethod(w, r, http.MethodPost) {
+			return
+		}
+		s.handleOAuthComplete(w, r, accountID)
+		return
+	}
+	if accountID, ok := resourceID(r.URL.Path, "/api/v1/accounts/", "/oauth"); ok {
+		switch r.Method {
+		case http.MethodPut:
+			s.handleOAuthCredential(w, r, accountID)
+		case http.MethodDelete:
+			s.handleOAuthCredentialDelete(w, r, accountID)
+		default:
+			allowMethod(w, r, http.MethodPut)
+		}
+		return
+	}
 	if accountID, ok := resourceID(r.URL.Path, "/api/v1/accounts/", "/browser-session"); ok {
 		switch r.Method {
 		case http.MethodPost:
@@ -692,6 +732,81 @@ func (s *Server) handleCredentialDelete(w http.ResponseWriter, r *http.Request, 
 	s.controlMu.Lock()
 	defer s.controlMu.Unlock()
 	if err := s.dashboardService.DeleteCredential(accountID); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "credential delete failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"account_id": accountID,
+		"status":     "deleted",
+	})
+}
+
+func (s *Server) handleOAuthCredential(w http.ResponseWriter, r *http.Request, accountID string) {
+	if !s.requireMutation(w, r) {
+		return
+	}
+	var patch oauthCredentialPatch
+	if err := decodeControlJSON(w, r, &patch); err != nil {
+		writeControlDecodeError(w, err)
+		return
+	}
+	providerID, spec, ok := s.providerSpec(patch.ProviderID)
+	if !ok || strings.TrimSpace(spec.Auth.AuthFileFormat) == "" || strings.TrimSpace(patch.CredentialsJSON) == "" {
+		writeJSONError(w, http.StatusBadRequest, "provider does not support local credential import")
+		return
+	}
+	if err := s.validateExistingAccountProvider(accountID, providerID); err != nil {
+		if errors.Is(err, errAccountProviderMismatch) {
+			writeJSONError(w, http.StatusBadRequest, "account provider mismatch")
+		} else {
+			writeJSONError(w, http.StatusInternalServerError, "configuration unavailable")
+		}
+		return
+	}
+	imported, err := auth.ParseLocalCredential(providerID, []byte(patch.CredentialsJSON))
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid local credential file")
+		return
+	}
+	s.invalidateOAuthFlows(accountID)
+
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	if err := s.persistAccountConfig(accountID, providerID, string(imported.AuthType), "", nil); err != nil {
+		if errors.Is(err, errAccountProviderMismatch) {
+			writeJSONError(w, http.StatusBadRequest, "account provider mismatch")
+		} else {
+			writeJSONError(w, http.StatusInternalServerError, "account save failed")
+		}
+		return
+	}
+	if err := s.saveOAuthCredential(accountID, imported.Credential); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "credential save failed")
+		return
+	}
+	expiresAt, expired := credentialExpiry(imported.Credential.ExpiresAt, s.nowUTC())
+	writeJSON(w, http.StatusOK, CredentialResponse{
+		AccountID:  accountID,
+		ProviderID: providerID,
+		Credential: CredentialStatusDTO{
+			Present:     true,
+			Kind:        string(imported.AuthType),
+			Source:      "stored",
+			ExpiresAt:   expiresAt,
+			Expired:     expired,
+			Refreshable: strings.TrimSpace(imported.Credential.RefreshToken) != "",
+		},
+	})
+}
+
+func (s *Server) handleOAuthCredentialDelete(w http.ResponseWriter, r *http.Request, accountID string) {
+	if !s.requireMutation(w, r) {
+		return
+	}
+	s.invalidateOAuthFlows(accountID)
+	s.controlMu.Lock()
+	defer s.controlMu.Unlock()
+	if err := s.deleteOAuthCredential(accountID); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, "credential delete failed")
 		return
 	}
@@ -872,9 +987,24 @@ func (s *Server) accountForValidation(accountID, providerID string, spec core.Pr
 }
 
 func (s *Server) persistAccountConfig(accountID, providerID, auth, apiKeyEnv string, browserCookie *core.BrowserCookieRef) error {
+	if s.configUpdater != nil {
+		return s.configUpdater(func(cfg *config.Config) error {
+			return applyAccountConfig(cfg, accountID, providerID, auth, apiKeyEnv, browserCookie)
+		})
+	}
 	cfg, err := s.configLoader()
 	if err != nil {
 		return err
+	}
+	if err := applyAccountConfig(&cfg, accountID, providerID, auth, apiKeyEnv, browserCookie); err != nil {
+		return err
+	}
+	return s.configSaver(cfg)
+}
+
+func applyAccountConfig(cfg *config.Config, accountID, providerID, auth, apiKeyEnv string, browserCookie *core.BrowserCookieRef) error {
+	if cfg == nil {
+		return errors.New("configuration is nil")
 	}
 	accountID = strings.TrimSpace(accountID)
 	providerID = strings.TrimSpace(providerID)
@@ -895,7 +1025,7 @@ func (s *Server) persistAccountConfig(accountID, providerID, auth, apiKeyEnv str
 			cookie := *browserCookie
 			cfg.Accounts[i].BrowserCookie = &cookie
 		}
-		return s.configSaver(cfg)
+		return nil
 	}
 
 	for _, account := range cfg.AutoDetectedAccounts {
@@ -917,7 +1047,7 @@ func (s *Server) persistAccountConfig(accountID, providerID, auth, apiKeyEnv str
 		account.BrowserCookie = &cookie
 	}
 	cfg.Accounts = append(cfg.Accounts, account)
-	return s.configSaver(cfg)
+	return nil
 }
 
 func (s *Server) serveIntegrationAPI(w http.ResponseWriter, r *http.Request) {

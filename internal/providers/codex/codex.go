@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/janekbaraniewski/openusage/internal/auth"
 	"github.com/janekbaraniewski/openusage/internal/core"
 	"github.com/janekbaraniewski/openusage/internal/providers/providerbase"
 	"github.com/janekbaraniewski/openusage/internal/providers/shared"
@@ -33,6 +34,7 @@ var errLiveUsageAuth = errors.New("live usage auth failed")
 
 type Provider struct {
 	providerbase.Base
+	oauthClient                  *auth.OAuthClient
 	telemetryCacheMu             sync.Mutex
 	telemetryCache               map[string]*telemetryCacheEntry
 	telemetryBaselineInitialized bool
@@ -49,21 +51,24 @@ type telemetryCacheEntry struct {
 }
 
 func New() *Provider {
-	return &Provider{
+	provider := &Provider{
 		Base: providerbase.New(core.ProviderSpec{
 			ID: "codex",
 			Info: core.ProviderInfo{
-				Name:         "OpenAI Codex CLI",
+				Name:         "ChatGPT / Codex",
 				Capabilities: []string{"local_sessions", "live_usage_endpoint", "rate_limits", "token_usage", "credits", "burn_rate", "by_model", "by_client"},
 				DocURL:       "https://github.com/openai/codex",
 			},
 			Auth: core.ProviderAuthSpec{
-				Type: core.ProviderAuthTypeToken,
+				Type:              core.ProviderAuthTypeOAuth,
+				SupplementalTypes: []core.ProviderAuthType{core.ProviderAuthTypeLocal},
+				DefaultAccountID:  "codex-cli",
+				AuthFileFormat:    "codex",
 			},
 			Setup: core.ProviderSetupSpec{
 				Quickstart: []string{
-					"Install Codex CLI and authenticate via `codex auth`.",
-					"Ensure local Codex history/config paths are readable.",
+					"Sign in with ChatGPT from Web Settings to read subscription limits.",
+					"Mount Codex data only when local session history is also needed.",
 				},
 			},
 			Dashboard: dashboardWidget(),
@@ -71,6 +76,8 @@ func New() *Provider {
 		telemetryCache: make(map[string]*telemetryCacheEntry),
 		creditHistory:  make(map[string][]creditUsageObservation),
 	}
+	provider.oauthClient = auth.NewOAuthClient(provider.Client())
+	return provider
 }
 
 type rateLimits struct {
@@ -222,6 +229,9 @@ func (p *Provider) HasChanged(acct core.AccountConfig, since time.Time) (bool, e
 	if configDir == "" {
 		return true, nil
 	}
+	if acct.OAuth != nil && strings.TrimSpace(acct.OAuth.AccessToken) != "" {
+		return true, nil
+	}
 	// Codex credit limits come from the authenticated remote/app-server
 	// sources and can change without any local session file being modified.
 	// Keep authenticated accounts polling so the dashboard can observe quota
@@ -332,7 +342,7 @@ func (p *Provider) Fetch(ctx context.Context, acct core.AccountConfig) (core.Usa
 	if !hasData {
 		if errors.Is(liveErr, errLiveUsageAuth) {
 			snap.Status = core.StatusAuth
-			snap.Message = "Codex auth required — run `codex login`"
+			snap.Message = "ChatGPT sign-in required"
 		} else {
 			snap.Status = core.StatusUnknown
 			snap.Message = "No Codex usage data found"
@@ -343,6 +353,11 @@ func (p *Provider) Fetch(ctx context.Context, acct core.AccountConfig) (core.Usa
 	p.applyCursorCompatibilityMetrics(&snap)
 	p.applyCreditForecast(&snap, acct.ID)
 	p.applyRateLimitStatus(&snap)
+	if errors.Is(liveErr, errLiveUsageAuth) {
+		snap.Status = core.StatusAuth
+		snap.Message = "ChatGPT sign-in required; local usage remains available"
+		return snap, nil
+	}
 
 	switch {
 	case (hasLiveData || hasCLIData) && hasLocalData:

@@ -233,6 +233,99 @@ func TestCredentialValidationPreservesCustomAccountFields(t *testing.T) {
 	}
 }
 
+func TestOAuthCredentialEndpointImportsAndRedactsLocalFile(t *testing.T) {
+	isolateWebConfig(t)
+	if err := config.Save(config.Config{AutoDetect: false}); err != nil {
+		t.Fatalf("seed config: %v", err)
+	}
+	provider := testProvider{spec: core.ProviderSpec{
+		ID:   "claude_code",
+		Info: core.ProviderInfo{Name: "Claude Code CLI"},
+		Auth: core.ProviderAuthSpec{
+			Type:           core.ProviderAuthTypeLocal,
+			AuthFileFormat: "claude_code",
+		},
+	}}
+	server, err := NewServer(Options{
+		ConfigLoader:     config.Load,
+		ConfigSaver:      config.Save,
+		ProviderLister:   func() []core.UsageProvider { return []core.UsageProvider{provider} },
+		ApplyCredentials: detect.ApplyCredentials,
+		Now:              fixedNow,
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	body := `{"claudeAiOauth":{"accessToken":"oauth-secret","refreshToken":"refresh-secret","expiresAt":1900000000000}}`
+	resp := doControlRequest(server, http.MethodPut, "/api/v1/accounts/claude-code/oauth", `{"provider_id":"claude_code","credentials_json":`+jsonString(body)+`}`)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("OAuth import status = %d: %s", resp.Code, resp.Body)
+	}
+	if strings.Contains(resp.Body.String(), "oauth-secret") || strings.Contains(resp.Body.String(), "refresh-secret") {
+		t.Fatalf("OAuth response leaked secret: %s", resp.Body)
+	}
+
+	creds, err := config.LoadCredentials()
+	if err != nil {
+		t.Fatalf("load credentials: %v", err)
+	}
+	if creds.OAuth["claude-code"].AccessToken != "oauth-secret" || creds.OAuth["claude-code"].RefreshToken != "refresh-secret" {
+		t.Fatalf("stored OAuth credential = %#v", creds.OAuth)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if len(cfg.Accounts) != 1 || cfg.Accounts[0].Auth != "oauth" {
+		t.Fatalf("stored account = %#v", cfg.Accounts)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/bootstrap", nil)
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("bootstrap status = %d: %s", response.Code, response.Body)
+	}
+	var bootstrap BootstrapResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &bootstrap); err != nil {
+		t.Fatalf("decode bootstrap: %v", err)
+	}
+	if len(bootstrap.Accounts) != 1 {
+		t.Fatalf("bootstrap accounts = %#v", bootstrap.Accounts)
+	}
+	if len(bootstrap.Providers) != 1 || bootstrap.Providers[0].AuthFileFormat != "claude_code" {
+		t.Fatalf("bootstrap auth-file metadata = %#v", bootstrap.Providers)
+	}
+	status := bootstrap.Accounts[0].Credential
+	if !status.Present || status.Source != "stored" || status.Kind != "oauth" || status.Expired || status.ExpiresAt == "" || !status.Refreshable {
+		t.Fatalf("OAuth status = %#v", status)
+	}
+	if strings.Contains(response.Body.String(), "oauth-secret") || strings.Contains(response.Body.String(), "refresh-secret") {
+		t.Fatalf("bootstrap leaked OAuth secret: %s", response.Body)
+	}
+
+	resp = doControlRequest(server, http.MethodDelete, "/api/v1/accounts/claude-code/oauth", "")
+	if resp.Code != http.StatusOK {
+		t.Fatalf("OAuth delete status = %d: %s", resp.Code, resp.Body)
+	}
+	creds, err = config.LoadCredentials()
+	if err != nil {
+		t.Fatalf("load credentials after delete: %v", err)
+	}
+	if _, ok := creds.OAuth["claude-code"]; ok {
+		t.Fatal("OAuth credential remains after delete")
+	}
+}
+
+func jsonString(value string) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		panic(err)
+	}
+	return string(data)
+}
+
 func TestBrowserSessionEndpointsUseDeclaredCookieAndHideValue(t *testing.T) {
 	isolateWebConfig(t)
 	service := dashboardapp.NewService(context.Background())

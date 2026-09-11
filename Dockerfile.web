@@ -4,15 +4,16 @@
 # Provider API keys are supplied at runtime; usage history and settings live in
 # the /data volume.
 
-# Build the Vite bundle without the marketing-site prerender step. The web
-# dashboard mounts fresh at /app and only needs the Vite output plus icons.
+# Build the dashboard-only Vite bundle without the marketing-site prerender
+# step. The container serves the dashboard from / and does not ship the
+# marketing homepage as its root document.
 FROM node:24-alpine3.22 AS web-builder
 
 WORKDIR /site
 COPY website/package.json website/package-lock.json ./
 RUN npm ci
 COPY website/ ./
-RUN npx vite build
+RUN npx vite build --mode dashboard
 
 # Build the CGO-enabled Go binary with the web bundle embedded.
 FROM golang:1.26-alpine3.22 AS go-builder
@@ -26,7 +27,7 @@ COPY . .
 COPY --from=web-builder /site/dist /src/website/dist
 
 RUN mkdir -p internal/web/static \
-    && cp website/dist/index.html internal/web/static/index.html \
+    && cp website/dist/dashboard.html internal/web/static/index.html \
     && rm -rf internal/web/static/assets internal/web/static/brand internal/web/static/icons \
     && cp -R website/dist/assets internal/web/static/assets \
     && cp -R website/dist/brand internal/web/static/brand \

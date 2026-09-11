@@ -354,6 +354,11 @@ const corruptBackupSuffix = ".corrupt"
 func repairCorruptFile(path string, cfg Config) error {
 	saveMu.Lock()
 	defer saveMu.Unlock()
+	unlock, err := lockFile(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -574,10 +579,15 @@ func Save(cfg Config) error {
 func SaveTo(path string, cfg Config) error {
 	saveMu.Lock()
 	defer saveMu.Unlock()
+	unlock, err := lockFile(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return saveLocked(path, cfg)
 }
 
-// saveLocked is the actual write path; callers MUST hold saveMu.
+// saveLocked is the actual write path; callers MUST hold saveMu and the file lock.
 func saveLocked(path string, cfg Config) error {
 	target := path
 	if _, err := os.Lstat(path); err == nil {
@@ -618,14 +628,33 @@ func saveLocked(path string, cfg Config) error {
 // If the file cannot be read, it returns an error without writing — this prevents
 // a failed read from silently overwriting user-set values with zero defaults.
 func modifyConfig(path string, mutate func(*Config)) error {
+	return updateConfig(path, func(cfg *Config) error {
+		mutate(cfg)
+		return nil
+	})
+}
+
+// Update performs a cross-process-safe read-modify-write of the main config.
+func Update(mutate func(*Config) error) error {
+	return updateConfig(ConfigPath(), mutate)
+}
+
+func updateConfig(path string, mutate func(*Config) error) error {
 	saveMu.Lock()
 	defer saveMu.Unlock()
+	unlock, err := lockFile(path)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 
 	cfg, err := LoadFrom(path)
 	if err != nil {
 		return fmt.Errorf("modifyConfig: reading current config: %w", err)
 	}
-	mutate(&cfg)
+	if err := mutate(&cfg); err != nil {
+		return err
+	}
 	return saveLocked(path, cfg)
 }
 

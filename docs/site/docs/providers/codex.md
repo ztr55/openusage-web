@@ -1,19 +1,21 @@
 ---
-title: Codex CLI
-description: Track OpenAI Codex CLI sessions, rate limits, and credit balance in OpenUsage.
+title: ChatGPT / Codex
+description: Track ChatGPT Codex subscription limits, credits, and optional local Codex sessions in OpenUsage.
 sidebar_label: Codex
 keywords: [codex cli usage tracker, codex cli quota tracking, codex cli cost tracking, codex cli token usage, track codex cli spend locally]
 ---
 
-# Codex CLI
+# ChatGPT / Codex
 
-Local-file provider for the OpenAI Codex CLI. Reads session logs, auth state, and config to show today's activity, plan info, and rate-limit windows.
+Tracks the Codex quota included with ChatGPT Plus, Pro, Team, and Enterprise.
+The CLI is optional: direct ChatGPT sign-in supplies live plan and rate-limit
+data, while mounted Codex session files add local activity details.
 
 ## At a glance
 
 - **Provider ID** — `codex`
-- **Detection** — `~/.codex` directory on disk
-- **Auth** — token stored in `~/.codex/auth.json` by the Codex CLI; no env var needed
+- **Detection** — direct sign-in in Web Settings, or a `~/.codex` directory on disk
+- **Auth** — ChatGPT device authorization with automatic token refresh; existing `~/.codex/auth.json` can also be imported
 - **Type** — coding agent
 - **Tracks**:
   - Latest session: tokens, model, client
@@ -26,6 +28,17 @@ Local-file provider for the OpenAI Codex CLI. Reads session logs, auth state, an
   - Patch stats
 
 ## Setup
+
+### ChatGPT subscription sign-in
+
+Open Settings → Credentials → Subscription sign-in, choose **ChatGPT / Codex**,
+and select **Connect ChatGPT**. Open the displayed ChatGPT page and enter the
+one-time code. OpenUsage checks for approval automatically and stores the
+resulting access and refresh tokens locally.
+
+This flow uses Codex's public device authorization protocol. It does not need a
+Codex installation, and it does not grant OpenAI Platform API access. Device
+authorization must be enabled for the ChatGPT account or workspace.
 
 ### Auto-detection
 
@@ -55,7 +68,7 @@ Override `config_dir` and `sessions_dir` only if the CLI uses non-default paths.
 Codex has three data paths:
 
 1. **Local files** — JSONL session transcripts and auth/config metadata under `~/.codex/`. Always available after a single Codex run.
-2. **Live ChatGPT usage endpoint** — an authenticated POST to ChatGPT's backend, only attempted when `~/.codex/auth.json` contains a non-empty access token. Provides plan, credits, and rate-limit windows.
+2. **Live ChatGPT usage endpoint** — an authenticated request to ChatGPT's backend, attempted after direct sign-in or when `~/.codex/auth.json` contains a non-empty access token. Provides plan, credits, and rate-limit windows.
 3. **Codex CLI app-server** — an authenticated local `codex app-server` JSON-RPC request to `account/rateLimits/read`. Provides the authoritative individual monthly credit limit and next reset when the live HTTP payload omits it.
 
 The base URL for the live endpoint is, in order: `acct.BaseURL` → `extra.chatgpt_base_url` → the value parsed from `~/.codex/config.toml` (`chatgpt_base_url`) → `https://chatgpt.com/backend-api`. The path is `/wham/usage` for `chatgpt.com/backend-api` and `/api/codex/usage` otherwise.
@@ -142,10 +155,12 @@ On a ChatGPT subscription plan (Plus, Pro, Team, Enterprise) the dollar number i
 
 ## API endpoints used
 
+- Device authorization: `POST https://auth.openai.com/api/accounts/deviceauth/usercode` and `POST https://auth.openai.com/api/accounts/deviceauth/token`.
+- Token exchange and refresh: `POST https://auth.openai.com/oauth/token`.
 - Optional live usage endpoint:
   - `GET https://chatgpt.com/backend-api/wham/usage` (default), or
   - `GET <base>/api/codex/usage` for non-ChatGPT bases.
-  - Headers: `Authorization: Bearer <auth.json access_token>` and `ChatGPT-Account-Id: <account_id>` when available.
+- Headers: `Authorization: Bearer <access_token>`, plus `ChatGPT-Account-Id: <account_id>` when available.
 - Optional local CLI quota endpoint: `codex -s read-only -a untrusted app-server`, using the standard JSON-RPC handshake followed by `account/rateLimits/read`.
 
 ## Files read
@@ -158,6 +173,7 @@ On a ChatGPT subscription plan (Plus, Pro, Team, Enterprise) the dollar number i
 ## Caveats
 
 - Individual credit usage and the forecast require authenticated Codex quota data from the live endpoint or CLI app-server; offline sessions still show local activity.
+- Codex device authorization is currently a beta protocol and may require reauthorization if OpenAI changes it.
 - Rate-limit windows are reported by the API and may differ from documented limits during quota changes.
 - The monthly period start is inferred from the next reset because Codex reports the reset boundary but not an explicit start timestamp.
 - The provider has hooks-style integration with the daemon: see [Daemon integrations](../daemon/integrations.md).
@@ -165,10 +181,12 @@ On a ChatGPT subscription plan (Plus, Pro, Team, Enterprise) the dollar number i
 ## Troubleshooting
 
 - **Tile is empty** — run `codex` once to populate `~/.codex/sessions/`.
-- **No credit usage or forecast** — `~/.codex/auth.json` is missing or expired, or the CLI app-server quota request failed. Re-authenticate with the Codex CLI and wait for the next daemon poll.
+- **No live limits** — connect ChatGPT in Web Settings and wait for the next daemon poll.
+- **Device login is disabled** — enable device-code authentication in ChatGPT security settings, or ask the workspace administrator to allow it.
+- **Refresh failed** — reconnect ChatGPT in Web Settings. OpenUsage normally rotates refresh tokens automatically.
 - **Sessions missing** — confirm `sessions_dir` matches the path Codex writes to.
 
 ## Related
 
-- [OpenAI](./openai.md) — direct API rate limits for the underlying models
+- [OpenAI](./openai.md) — separate pay-as-you-go Platform API usage; a ChatGPT subscription does not include it
 - [Claude Code](./claude-code.md) — sibling local-file coding-agent provider

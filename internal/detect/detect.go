@@ -534,16 +534,16 @@ func detectEnvKeys(result *Result) {
 	}
 }
 
-// ApplyCredentials fills in Token for accounts that have no API key from env vars,
-// using stored credentials from the credentials file. It also creates new accounts
-// for stored credentials that don't match any existing account.
+// ApplyCredentials fills in runtime credentials from the credentials file. It
+// also creates new accounts for known stored credentials that don't match an
+// existing account.
 func ApplyCredentials(result *Result) {
 	creds, err := config.LoadCredentials()
 	if err != nil {
 		log.Printf("[detect] Failed to load credentials: %v", err)
 		return
 	}
-	if len(creds.Keys) == 0 {
+	if len(creds.Keys) == 0 && len(creds.OAuth) == 0 {
 		return
 	}
 
@@ -551,6 +551,16 @@ func ApplyCredentials(result *Result) {
 	applied := make(map[string]bool, len(result.Accounts))
 	for i := range result.Accounts {
 		acct := &result.Accounts[i]
+		if oauth, ok := creds.OAuth[acct.ID]; ok && strings.TrimSpace(oauth.AccessToken) != "" {
+			credential := oauth
+			acct.OAuth = &credential
+			if acct.Token == "" {
+				acct.Token = credential.AccessToken
+			}
+			acct.SetHint("oauth_source", "stored")
+			applied[acct.ID] = true
+			continue
+		}
 		if acct.Token != "" || acct.ResolveAPIKey() != "" {
 			applied[acct.ID] = true
 			continue
@@ -580,6 +590,29 @@ func ApplyCredentials(result *Result) {
 		})
 		log.Printf("[detect] Created account %s from stored credential", accountID)
 	}
+
+	for accountID, credential := range creds.OAuth {
+		if applied[accountID] || strings.TrimSpace(credential.AccessToken) == "" {
+			continue
+		}
+		provider, authType := providerForStoredOAuth(accountID)
+		if provider == "" {
+			log.Printf("[detect] Stored OAuth credential for unknown account %s, skipping", accountID)
+			continue
+		}
+		credential := credential
+		result.Accounts = append(result.Accounts, core.AccountConfig{
+			ID:       accountID,
+			Provider: provider,
+			Auth:     authType,
+			Token:    credential.AccessToken,
+			OAuth:    &credential,
+			RuntimeHints: map[string]string{
+				"oauth_source": "stored",
+			},
+		})
+		log.Printf("[detect] Created account %s from stored OAuth credential", accountID)
+	}
 }
 
 // providerForStoredCredential maps a stored credential's account ID to its
@@ -592,6 +625,17 @@ func providerForStoredCredential(accountID string) string {
 		}
 	}
 	return ""
+}
+
+func providerForStoredOAuth(accountID string) (provider, authType string) {
+	switch accountID {
+	case "claude-code":
+		return "claude_code", string(core.ProviderAuthTypeOAuth)
+	case "codex-cli":
+		return "codex", string(core.ProviderAuthTypeOAuth)
+	default:
+		return "", ""
+	}
 }
 
 func (r Result) Summary() string {

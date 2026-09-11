@@ -53,6 +53,10 @@ The listen address must include a loopback host unless `--allow-public` is set
 with `OPENUSAGE_WEB_TOKEN`. The web API redacts raw provider metadata and never
 returns API keys or browser-cookie values.
 
+`--dashboard-path` defaults to `/app/` for the full website build. The
+dashboard-only Docker build sets it to `/`. When `OPENUSAGE_WEB_TOKEN` is set,
+the browser prompts for the token instead of receiving it in the URL.
+
 ## `openusage version`
 
 ```

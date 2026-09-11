@@ -2,6 +2,7 @@ package claude_code
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -19,8 +20,8 @@ import (
 type Provider struct {
 	providerbase.Base
 	mu                  sync.Mutex
-	usageAPICache       *usageResponse // last successful Usage API response
-	lastUsageAuthSource string         // name of the usageAuthSource that last succeeded; empty until a first success
+	usageAPICache       map[string]*usageResponse // account ID -> last successful Usage API response
+	lastUsageAuthSource map[string]string         // account ID -> last successful auth source
 
 	jsonlCacheMu sync.Mutex
 	jsonlCache   map[string]*jsonlCacheEntry // keyed by file path
@@ -51,7 +52,7 @@ func New() *Provider {
 		Base: providerbase.New(core.ProviderSpec{
 			ID: "claude_code",
 			Info: core.ProviderInfo{
-				Name: "Claude Code CLI",
+				Name: "Claude / Claude Code",
 				Capabilities: []string{
 					"local_stats", "daily_activity", "model_tokens",
 					"account_info", "jsonl_conversations", "5h_billing_blocks",
@@ -60,16 +61,21 @@ func New() *Provider {
 				DocURL: "https://code.claude.com/",
 			},
 			Auth: core.ProviderAuthSpec{
-				Type: core.ProviderAuthTypeLocal,
+				Type:              core.ProviderAuthTypeLocal,
+				SupplementalTypes: []core.ProviderAuthType{core.ProviderAuthTypeOAuth},
+				DefaultAccountID:  "claude-code",
+				AuthFileFormat:    "claude_code",
 			},
 			Setup: core.ProviderSetupSpec{
 				Quickstart: []string{
-					"Install Claude Code and authenticate in the CLI.",
-					"Ensure Claude Code local stats/config files are readable.",
+					"Sign in with Claude from Web Settings for subscription usage limits.",
+					"Mount Claude Code data only when local session history is also needed.",
 				},
 			},
 			Dashboard: dashboardWidget(),
 		}),
+		usageAPICache:       make(map[string]*usageResponse),
+		lastUsageAuthSource: make(map[string]string),
 	}
 }
 
@@ -328,6 +334,9 @@ func (p *Provider) DetailWidget() core.DetailWidget {
 
 // HasChanged reports whether any of the local data sources have been modified since the given time.
 func (p *Provider) HasChanged(acct core.AccountConfig, since time.Time) (bool, error) {
+	if acct.OAuth != nil && strings.TrimSpace(acct.OAuth.AccessToken) != "" {
+		return true, nil
+	}
 	home, _ := os.UserHomeDir()
 	claudeDir := filepath.Join(home, ".claude")
 	if override := acct.Hint("claude_dir", ""); override != "" {
@@ -414,9 +423,12 @@ func (p *Provider) Fetch(ctx context.Context, acct core.AccountConfig) (core.Usa
 		hasData = true
 	}
 
-	if orgUUID, ok := snap.Raw["organization_uuid"]; ok && orgUUID != "" {
-		if err := p.readUsageAPI(ctx, orgUUID, &snap); err != nil {
+	orgUUID := snap.Raw["organization_uuid"]
+	usageAuthFailed := false
+	if orgUUID != "" || acct.OAuth != nil {
+		if err := p.readUsageAPIForAccount(ctx, orgUUID, acct, &snap); err != nil {
 			snap.Raw["usage_api_error"] = err.Error()
+			usageAuthFailed = errors.Is(err, errUsageAPIAuth)
 		} else {
 			hasData = true
 		}
@@ -425,8 +437,18 @@ func (p *Provider) Fetch(ctx context.Context, acct core.AccountConfig) (core.Usa
 	normalizeModelUsage(&snap)
 
 	if !hasData {
+		if usageAuthFailed {
+			snap.Status = core.StatusAuth
+			snap.Message = "Claude sign-in required"
+			return snap, nil
+		}
 		snap.Status = core.StatusError
 		snap.Message = "No Claude Code stats data accessible"
+		return snap, nil
+	}
+	if usageAuthFailed {
+		snap.Status = core.StatusAuth
+		snap.Message = "Claude sign-in required; local usage remains available"
 		return snap, nil
 	}
 
@@ -441,17 +463,26 @@ func (p *Provider) Fetch(ctx context.Context, acct core.AccountConfig) (core.Usa
 // isn't available.
 type usageAuthSource struct {
 	name    string
-	prepare func() (url string, setAuth func(*http.Request), err error)
+	prepare func(context.Context) (url string, setAuth func(*http.Request), err error)
+	refresh func(context.Context) (url string, setAuth func(*http.Request), err error)
 }
+
+var errUsageAPIAuth = errors.New("usage API authentication failed")
 
 // usageAuthSources lists the auth sources in priority order: cookie/org
 // (macOS desktop app) first, then the CLI's own OAuth token as the fallback
 // used everywhere the desktop app's session cookies aren't available.
-func (p *Provider) usageAuthSources(orgUUID string) []usageAuthSource {
-	return []usageAuthSource{
-		{
+func (p *Provider) usageAuthSources(orgUUID string, accounts ...core.AccountConfig) []usageAuthSource {
+	account := core.AccountConfig{}
+	if len(accounts) > 0 {
+		account = accounts[0]
+	}
+	sources := make([]usageAuthSource, 0, 2)
+	explicitOAuth := account.OAuth != nil || strings.EqualFold(strings.TrimSpace(account.Auth), string(core.ProviderAuthTypeOAuth))
+	if strings.TrimSpace(orgUUID) != "" && !explicitOAuth {
+		sources = append(sources, usageAuthSource{
 			name: "cookie",
-			prepare: func() (string, func(*http.Request), error) {
+			prepare: func(context.Context) (string, func(*http.Request), error) {
 				cookies, err := getClaudeSessionCookies()
 				if err != nil {
 					return "", nil, err
@@ -459,18 +490,29 @@ func (p *Provider) usageAuthSources(orgUUID string) []usageAuthSource {
 				url := fmt.Sprintf("https://claude.ai/api/organizations/%s/usage", orgUUID)
 				return url, cookieAuthHeaders(cookies), nil
 			},
-		},
-		{
-			name: "oauth",
-			prepare: func() (string, func(*http.Request), error) {
-				token, err := readClaudeCodeOAuthToken()
-				if err != nil {
-					return "", nil, err
-				}
-				return oauthUsageURL, oauthAuthHeaders(token), nil
-			},
-		},
+		})
 	}
+	sources = append(sources, usageAuthSource{
+		name: "oauth",
+		prepare: func(ctx context.Context) (string, func(*http.Request), error) {
+			oauth, err := readClaudeCodeOAuthCredential(ctx, account)
+			if err != nil {
+				return "", nil, fmt.Errorf("%w: %v", errUsageAPIAuth, err)
+			}
+			return oauthUsageURL, oauthAuthHeaders(oauth.AccessToken), nil
+		},
+		refresh: func(ctx context.Context) (string, func(*http.Request), error) {
+			if account.OAuth == nil {
+				return "", nil, fmt.Errorf("%w: OAuth credential cannot be refreshed", errUsageAPIAuth)
+			}
+			oauth, err := refreshClaudeCodeOAuth(ctx, *account.OAuth, account)
+			if err != nil {
+				return "", nil, fmt.Errorf("%w: %v", errUsageAPIAuth, err)
+			}
+			return oauthUsageURL, oauthAuthHeaders(oauth.AccessToken), nil
+		},
+	})
+	return sources
 }
 
 // cookieAuthHeaders builds the auth closure for the cookie/org usage source:
@@ -507,32 +549,46 @@ func oauthAuthHeaders(token string) func(*http.Request) {
 // pinned source stops working, the pin is cleared so the next call re-scans
 // all sources from scratch.
 func (p *Provider) readUsageAPI(ctx context.Context, orgUUID string, snap *core.UsageSnapshot) error {
-	sources := p.usageAuthSources(orgUUID)
+	return p.readUsageAPIForAccount(ctx, orgUUID, core.AccountConfig{}, snap)
+}
 
-	if pinned := p.getLastUsageAuthSource(); pinned != "" {
+func (p *Provider) readUsageAPIForAccount(ctx context.Context, orgUUID string, acct core.AccountConfig, snap *core.UsageSnapshot) error {
+	sources := p.usageAuthSources(orgUUID, acct)
+	cacheKey := strings.TrimSpace(acct.ID)
+
+	if pinned := p.getLastUsageAuthSource(cacheKey); pinned != "" {
 		src, ok := findUsageAuthSource(sources, pinned)
 		if ok {
-			if err := p.tryUsageAuthSource(ctx, src, snap); err == nil {
+			err := p.tryUsageAuthSource(ctx, src, snap, cacheKey)
+			if err == nil {
 				return nil
 			}
-			p.setLastUsageAuthSource("")
+			p.setLastUsageAuthSource(cacheKey, "")
+			if pinned == "oauth" && acct.OAuth != nil && errors.Is(err, errUsageAPIAuth) {
+				return err
+			}
 		}
-		if p.applyCachedUsage(snap) {
+		if p.applyCachedUsage(snap, cacheKey) {
 			return nil
 		}
 		return fmt.Errorf("%s auth source (previously successful) failed and no cached usage available", pinned)
 	}
 
 	var errs []string
+	oauthAuthFailed := false
 	for _, src := range sources {
-		if err := p.tryUsageAuthSource(ctx, src, snap); err == nil {
+		if err := p.tryUsageAuthSource(ctx, src, snap, cacheKey); err == nil {
 			return nil
 		} else {
 			errs = append(errs, fmt.Sprintf("%s: %v", src.name, err))
+			oauthAuthFailed = oauthAuthFailed || (acct.OAuth != nil && src.name == "oauth" && errors.Is(err, errUsageAPIAuth))
 		}
 	}
 
-	if p.applyCachedUsage(snap) {
+	if oauthAuthFailed {
+		return fmt.Errorf("%w: %s", errUsageAPIAuth, strings.Join(errs, "; "))
+	}
+	if p.applyCachedUsage(snap, cacheKey) {
 		return nil
 	}
 	return fmt.Errorf("all usage API sources failed: %s", strings.Join(errs, "; "))
@@ -549,25 +605,32 @@ func findUsageAuthSource(sources []usageAuthSource, name string) (usageAuthSourc
 
 // tryUsageAuthSource attempts a single auth source. On success it applies
 // the fetched usage to snap and pins the source for subsequent calls.
-func (p *Provider) tryUsageAuthSource(ctx context.Context, src usageAuthSource, snap *core.UsageSnapshot) error {
-	url, setAuth, err := src.prepare()
+func (p *Provider) tryUsageAuthSource(ctx context.Context, src usageAuthSource, snap *core.UsageSnapshot, cacheKey string) error {
+	url, setAuth, err := src.prepare(ctx)
 	if err != nil {
 		return err
 	}
 	usage, err := fetchUsageAPIWithAuth(ctx, url, setAuth)
+	if errors.Is(err, errUsageAPIAuth) && src.refresh != nil {
+		url, setAuth, refreshErr := src.refresh(ctx)
+		if refreshErr != nil {
+			return refreshErr
+		}
+		usage, err = fetchUsageAPIWithAuth(ctx, url, setAuth)
+	}
 	if err != nil {
 		return err
 	}
-	p.applyFetchedUsage(usage, snap, src.name)
-	p.setLastUsageAuthSource(src.name)
+	p.applyFetchedUsage(usage, snap, src.name, cacheKey)
+	p.setLastUsageAuthSource(cacheKey, src.name)
 	return nil
 }
 
 // applyFetchedUsage records a freshly fetched usage response as the shared
 // cache and applies it to snap. source names which auth source produced it
 // (e.g. "cookie", "oauth").
-func (p *Provider) applyFetchedUsage(usage *usageResponse, snap *core.UsageSnapshot, source string) {
-	p.setCachedUsage(usage)
+func (p *Provider) applyFetchedUsage(usage *usageResponse, snap *core.UsageSnapshot, source, cacheKey string) {
+	p.setCachedUsage(cacheKey, usage)
 	applyUsageResponse(usage, snap, time.Now())
 	cacheFiveHourFromSnapshot(snap)
 	snap.Raw["usage_api_ok"] = "true"
@@ -576,8 +639,8 @@ func (p *Provider) applyFetchedUsage(usage *usageResponse, snap *core.UsageSnaps
 
 // applyCachedUsage applies the last cached usage response to snap, if any,
 // reporting whether a cached value was available.
-func (p *Provider) applyCachedUsage(snap *core.UsageSnapshot) bool {
-	cached := p.getCachedUsage()
+func (p *Provider) applyCachedUsage(snap *core.UsageSnapshot, cacheKey string) bool {
+	cached := p.getCachedUsage(cacheKey)
 	if cached == nil {
 		return false
 	}
@@ -600,26 +663,36 @@ func cacheFiveHourFromSnapshot(snap *core.UsageSnapshot) {
 	}
 }
 
-func (p *Provider) getCachedUsage() *usageResponse {
+func (p *Provider) getCachedUsage(cacheKey string) *usageResponse {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.usageAPICache
+	return p.usageAPICache[cacheKey]
 }
 
-func (p *Provider) setCachedUsage(u *usageResponse) {
+func (p *Provider) setCachedUsage(cacheKey string, u *usageResponse) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.usageAPICache = u
+	if p.usageAPICache == nil {
+		p.usageAPICache = make(map[string]*usageResponse)
+	}
+	p.usageAPICache[cacheKey] = u
 }
 
-func (p *Provider) getLastUsageAuthSource() string {
+func (p *Provider) getLastUsageAuthSource(cacheKey string) string {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.lastUsageAuthSource
+	return p.lastUsageAuthSource[cacheKey]
 }
 
-func (p *Provider) setLastUsageAuthSource(name string) {
+func (p *Provider) setLastUsageAuthSource(cacheKey, name string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.lastUsageAuthSource = name
+	if p.lastUsageAuthSource == nil {
+		p.lastUsageAuthSource = make(map[string]string)
+	}
+	if name == "" {
+		delete(p.lastUsageAuthSource, cacheKey)
+		return
+	}
+	p.lastUsageAuthSource[cacheKey] = name
 }

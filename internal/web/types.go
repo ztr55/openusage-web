@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/janekbaraniewski/openusage/internal/auth"
 	"github.com/janekbaraniewski/openusage/internal/config"
 	"github.com/janekbaraniewski/openusage/internal/core"
 	"github.com/janekbaraniewski/openusage/internal/daemon"
@@ -20,14 +21,16 @@ const (
 // Options wires the web process to the existing local runtime. Snapshot reads
 // always go through Runtime; provider validation is delegated to dashboardapp.
 type Options struct {
-	Runtime     *daemon.ViewRuntime
-	SocketPath  string
-	StaticDir   string
-	AllowPublic bool
-	AuthToken   string
+	Runtime       *daemon.ViewRuntime
+	SocketPath    string
+	StaticDir     string
+	AllowPublic   bool
+	AuthToken     string
+	DashboardPath string
 
 	ConfigLoader             func() (config.Config, error)
 	ConfigSaver              func(config.Config) error
+	ConfigUpdater            func(func(*config.Config) error) error
 	CredentialsLoader        func() (config.Credentials, error)
 	DashboardService         *dashboardapp.Service
 	Discover                 func() detect.Result
@@ -43,6 +46,9 @@ type Options struct {
 	UninstallIntegration     func(integrations.ID) error
 	SaveIntegrationState     func(string, config.IntegrationState) error
 	InstallDaemon            func() error
+	OAuthClient              *auth.OAuthClient
+	SaveOAuthCredential      func(string, core.OAuthCredential) error
+	DeleteOAuthCredential    func(string) error
 
 	Now     func() time.Time
 	OnReady func(string)
@@ -79,13 +85,17 @@ type ProviderDTO struct {
 	BrowserCookieDomain string   `json:"browser_cookie_domain,omitempty"`
 	BrowserCookieName   string   `json:"browser_cookie_name,omitempty"`
 	BrowserConsoleURL   string   `json:"browser_console_url,omitempty"`
+	AuthFileFormat      string   `json:"auth_file_format,omitempty"`
 }
 
 type CredentialStatusDTO struct {
-	Present bool   `json:"present"`
-	Kind    string `json:"kind,omitempty"`
-	Source  string `json:"source,omitempty"`
-	EnvVar  string `json:"env_var,omitempty"`
+	Present     bool   `json:"present"`
+	Kind        string `json:"kind,omitempty"`
+	Source      string `json:"source,omitempty"`
+	EnvVar      string `json:"env_var,omitempty"`
+	ExpiresAt   string `json:"expires_at,omitempty"`
+	Expired     bool   `json:"expired"`
+	Refreshable bool   `json:"refreshable,omitempty"`
 }
 
 type BrowserSessionDTO struct {
@@ -237,6 +247,16 @@ type CredentialResponse struct {
 	AccountID  string              `json:"account_id"`
 	ProviderID string              `json:"provider_id"`
 	Credential CredentialStatusDTO `json:"credential"`
+}
+
+type OAuthStartResponse struct {
+	FlowID           string `json:"flow_id"`
+	ProviderID       string `json:"provider_id"`
+	AuthorizationURL string `json:"authorization_url,omitempty"`
+	VerificationURL  string `json:"verification_url,omitempty"`
+	UserCode         string `json:"user_code,omitempty"`
+	IntervalSeconds  int64  `json:"interval_seconds,omitempty"`
+	ExpiresAt        string `json:"expires_at"`
 }
 
 type BrowserSessionResponse struct {

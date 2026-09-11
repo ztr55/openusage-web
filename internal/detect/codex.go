@@ -6,8 +6,10 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
+	"github.com/janekbaraniewski/openusage/internal/auth"
 	"github.com/janekbaraniewski/openusage/internal/core"
 )
 
@@ -67,6 +69,14 @@ func detectCodex(result *Result) {
 	if hasAuth {
 		acct.SetHint("auth_file", authFile)
 		acct.RuntimeHints["auth_file"] = authFile
+		if data, readErr := os.ReadFile(authFile); readErr == nil {
+			if imported, parseErr := auth.ParseLocalCredential("codex", data); parseErr == nil {
+				acct.SetHint("credential_source", "file:"+authFile)
+				if imported.Credential.ExpiresAt > 0 {
+					acct.SetHint("credential_expires_at", strconv.FormatInt(imported.Credential.ExpiresAt, 10))
+				}
+			}
+		}
 		email, accountID, planType, openaiAPIKey := extractCodexAuth(authFile)
 		if email != "" {
 			acct.RuntimeHints["email"] = email

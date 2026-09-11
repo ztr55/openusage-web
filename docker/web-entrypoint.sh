@@ -38,6 +38,7 @@ done
 
 openusage web \
   --listen "${OPENUSAGE_WEB_LISTEN:-0.0.0.0:8787}" \
+  --dashboard-path / \
   --allow-public \
   --no-open &
 web_pid=$!

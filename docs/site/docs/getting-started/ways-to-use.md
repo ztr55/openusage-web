@@ -51,6 +51,9 @@ The command opens `http://127.0.0.1:8787/app/` by default. Use
 point at another built website directory. The server refuses non-loopback bind
 addresses because the API can manage local credentials and files.
 
+The Docker image uses a dashboard-only build at `/` instead of the website and
+uses the same in-page access-token prompt described in the Docker guide.
+
 For a container deployment, see the [Docker web dashboard guide](../guides/web-dashboard.md).
 
 ## Headless CLI reports

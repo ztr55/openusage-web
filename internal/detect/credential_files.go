@@ -6,9 +6,11 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/janekbaraniewski/openusage/internal/auth"
 	"github.com/janekbaraniewski/openusage/internal/core"
 )
 
@@ -58,16 +60,15 @@ func probeClaudeCodeCredentialsFile(result *Result) {
 		log.Printf("[detect] claude code credentials read error: %v", err)
 		return
 	}
-	var creds struct {
-		AccessToken string `json:"accessToken"`
-	}
-	if err := json.Unmarshal(data, &creds); err != nil || creds.AccessToken == "" {
+	imported, err := auth.ParseLocalCredential("claude_code", data)
+	if err != nil {
 		return
 	}
 
 	source := "file:" + path
 	annotateOrCreateAccount(result, "claude-code", "claude_code", "local", source,
 		filepath.Join(home, ".claude"))
+	annotateCredentialMetadata(result, "claude-code", source, imported.Credential)
 	log.Printf("[detect] claude code credentials present at %s", path)
 }
 
@@ -204,4 +205,20 @@ func annotateOrCreateAccount(result *Result, accountID, provider, auth, source, 
 		acct.SetPath("config_dir", defaultConfigDir)
 	}
 	addAccount(result, acct)
+}
+
+func annotateCredentialMetadata(result *Result, accountID, source string, credential core.OAuthCredential) {
+	for i := range result.Accounts {
+		if result.Accounts[i].ID != accountID {
+			continue
+		}
+		result.Accounts[i].SetHint("credential_source", source)
+		if credential.ExpiresAt > 0 {
+			result.Accounts[i].SetHint("credential_expires_at", strconv.FormatInt(credential.ExpiresAt, 10))
+		}
+		if credential.RefreshToken != "" {
+			result.Accounts[i].SetHint("credential_refreshable", "true")
+		}
+		return
+	}
 }

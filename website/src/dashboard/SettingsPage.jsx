@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  completeOAuthAuthorization,
   connectBrowserSession,
   deleteBrowserSession,
   deleteCredential,
@@ -12,8 +13,11 @@ import {
   patchTheme,
   patchTimeWindow,
   patchUISettings,
+  saveOAuthCredential,
+  startOAuthAuthorization,
   uninstallIntegration,
   saveCredential,
+  deleteOAuthCredential,
 } from "./api";
 import { accountName, providerName } from "./data";
 import { Icon, ProviderIcon } from "./icons";
@@ -60,7 +64,7 @@ export default function SettingsPage({ bootstrap, onChanged }) {
           {activeSection === "display" ? <DisplaySettings bootstrap={bootstrap} busy={busy} update={update} /> : null}
           {activeSection === "providers" ? <ProviderSettings bootstrap={bootstrap} busy={busy} update={update} /> : null}
           {activeSection === "sections" ? <SectionSettings bootstrap={bootstrap} busy={busy} update={update} /> : null}
-          {activeSection === "credentials" ? <CredentialSettings bootstrap={bootstrap} busy={busy} update={update} /> : null}
+          {activeSection === "credentials" ? <CredentialSettings bootstrap={bootstrap} busy={busy} onChanged={onChanged} update={update} /> : null}
           {activeSection === "integrations" ? <IntegrationSettings bootstrap={bootstrap} busy={busy} update={update} /> : null}
           {activeSection === "telemetry" ? <TelemetrySettings bootstrap={bootstrap} busy={busy} update={update} /> : null}
         </div>
@@ -188,12 +192,19 @@ function SectionList({ busy, entries, labelMap, onToggle, title }) {
   return <div className="section-list"><div className="settings-subheading"><span className="panel-kicker">LAYOUT</span><h3>{title}</h3></div>{entries.map((entry) => <div className="section-setting-row" key={entry.id}><span>{labelMap[entry.id] || entry.id}</span><Toggle label={`Show ${labelMap[entry.id] || entry.id}`} checked={entry.enabled} disabled={busy} onChange={() => onToggle(entry.id)} /></div>)}</div>;
 }
 
-function CredentialSettings({ bootstrap, busy, update }) {
+function CredentialSettings({ bootstrap, busy, onChanged, update }) {
   const providers = (bootstrap?.providers || []).filter((provider) => provider.auth_type === "api_key" || provider.auth_types?.includes("api_key"));
+  const importProviders = (bootstrap?.providers || []).filter((provider) => provider.auth_file_format);
+  const oauthProviders = (bootstrap?.providers || [])
+    .filter((provider) => ["codex", "claude_code"].includes(provider.id) && (provider.auth_type === "oauth" || provider.auth_types?.includes("oauth")))
+    .sort((left, right) => left.id === "codex" ? -1 : right.id === "codex" ? 1 : 0);
   const accounts = bootstrap?.accounts || [];
   const [providerID, setProviderID] = useState(providers[0]?.id || "");
   const [accountID, setAccountID] = useState(providers[0]?.default_account_id || "");
   const [apiKey, setAPIKey] = useState("");
+  const [importProviderID, setImportProviderID] = useState(importProviders[0]?.id || "");
+  const [importAccountID, setImportAccountID] = useState(importProviders[0]?.default_account_id || "");
+  const [credentialsJSON, setCredentialsJSON] = useState("");
   const [selectedBrowserAccount, setSelectedBrowserAccount] = useState("");
   const [browsers, setBrowsers] = useState([]);
   const [browser, setBrowser] = useState("");
@@ -210,7 +221,13 @@ function CredentialSettings({ bootstrap, busy, update }) {
     setAccountID(providers.find((provider) => provider.id === next)?.default_account_id || next);
   }
 
-  async function connect(account, provider) {
+  function selectImportProvider(next) {
+    setImportProviderID(next);
+    const account = accounts.find((candidate) => candidate.provider_id === next);
+    setImportAccountID(account?.id || importProviders.find((provider) => provider.id === next)?.default_account_id || next);
+  }
+
+  async function connect(account) {
     setSelectedBrowserAccount(account.id);
     setBrowserError("");
     try {
@@ -231,16 +248,211 @@ function CredentialSettings({ bootstrap, busy, update }) {
   }
 
   return <div className="settings-section"><SettingsHeading kicker="CREDENTIALS" title="Keep the keys close, never in the browser" detail="The Go helper validates and stores credentials locally. This page only receives a status." />
+    {oauthProviders.length ? <OAuthAuthorizationForm accounts={accounts} onChanged={onChanged} providers={oauthProviders} /> : null}
+    <div className="settings-subheading"><span className="panel-kicker">API KEYS</span><h3>Connect pay-as-you-go API accounts</h3></div>
     <div className="credential-form"><div className="form-grid form-grid--credential"><SettingField label="Provider"><select value={providerID} onChange={(event) => selectProvider(event.target.value)}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></SettingField><SettingField label="Account ID"><input value={accountID} onChange={(event) => setAccountID(event.target.value)} placeholder="my-account" /></SettingField></div><SettingField label="API key" detail="It is sent over loopback for validation, then cleared from this form."><div className="credential-input-row"><input autoComplete="off" onChange={(event) => setAPIKey(event.target.value)} placeholder="Paste a provider key" type="password" value={apiKey} /><button className="button button--primary" disabled={!providerID || !accountID.trim() || !apiKey.trim() || Boolean(busy)} onClick={() => update("credential", async () => { await saveCredential(accountID.trim(), providerID, apiKey); setAPIKey(""); })} type="button">{busy === "credential" ? "Checking..." : "Validate & save"}<Icon name="arrow" size={15} /></button></div></SettingField></div>
+    {importProviders.length ? <OAuthCredentialForm accountID={importAccountID} credentialsJSON={credentialsJSON} onAccountChange={setImportAccountID} onJSONChange={setCredentialsJSON} onProviderChange={selectImportProvider} providerID={importProviderID} providers={importProviders} busy={busy} update={update} /> : null}
     <div className="settings-subheading"><span className="panel-kicker">LOCAL ACCOUNTS</span><h3>Configured and discovered sources</h3></div>
-    <div className="credential-list">{accounts.map((account) => <CredentialRow account={account} bootstrap={bootstrap} busy={busy} key={account.id} onDelete={() => update(`delete:${account.id}`, () => deleteCredential(account.id))} />)}</div>
+    <div className="credential-list">{accounts.map((account) => <CredentialRow account={account} bootstrap={bootstrap} busy={busy} key={account.id} onDelete={() => update(`delete:${account.id}`, () => deleteCredential(account.id))} onDeleteOAuth={() => { if (window.confirm(`Disconnect ${accountName(account.id)}?`)) update(`delete-oauth:${account.id}`, () => deleteOAuthCredential(account.id)); }} />)}</div>
     {browserProviders.length ? <><div className="settings-subheading"><span className="panel-kicker">BROWSER SESSIONS</span><h3>Connect to dashboard-only data</h3></div>{browserError ? <div className="settings-inline-error" role="alert"><Icon name="warning" size={15} />{browserError}</div> : null}<div className="browser-session-list">{browserProviders.map((provider, index) => { const account = browserAccounts[index]; const session = account.browser_session || {}; return <div className="browser-session-row" key={account.id}><ProviderIcon name={provider.name} providerID={provider.id} size={30} /><div className="browser-session-row__copy"><strong>{accountName(account.id)}</strong><span>{session.connected ? `Connected via ${session.source_browser || "browser"}` : "Not connected"}{session.expired ? " · expired" : ""}</span></div><div className="browser-session-row__actions">{provider.browser_console_url ? <button className="text-button" onClick={() => window.open(provider.browser_console_url, "_blank", "noopener,noreferrer")} type="button">Open console <Icon name="external" size={14} /></button> : null}{session.connected ? <button className="text-button text-button--danger" disabled={Boolean(busy)} onClick={() => update(`disconnect:${account.id}`, () => deleteBrowserSession(account.id))} type="button">Disconnect</button> : <button className="button button--secondary" disabled={Boolean(busy)} onClick={() => connect(account, provider)} type="button">Choose browser <Icon name="arrow" size={14} /></button>}</div>{selectedBrowserAccount === account.id ? <div className="browser-picker"><select value={browser} onChange={(event) => setBrowser(event.target.value)}>{browsers.map((item) => <option key={item} value={item}>{item}</option>)}</select><button className="button button--primary" disabled={!browser || Boolean(busy)} onClick={() => connectSelected(account, provider)} type="button">Read selected cookie</button></div> : null}</div>; })}</div><div className="settings-footnote"><Icon name="shield" size={15} />OpenUsage reads only the browser and cookie you choose. Cookie values never reach this page.</div></> : null}
   </div>;
 }
 
-function CredentialRow({ account, bootstrap, busy, onDelete }) {
+function OAuthAuthorizationForm({ accounts, onChanged, providers }) {
+  const initialProvider = providers[0];
+  const initialAccount = accounts.find((account) => account.provider_id === initialProvider?.id);
+  const [providerID, setProviderID] = useState(initialProvider?.id || "");
+  const [accountID, setAccountID] = useState(initialAccount?.id || initialProvider?.default_account_id || "");
+  const [flow, setFlow] = useState(null);
+  const [authorizationResponse, setAuthorizationResponse] = useState("");
+  const [authorizationBusy, setAuthorizationBusy] = useState("");
+  const [authorizationMessage, setAuthorizationMessage] = useState("");
+  const abortRef = useRef(null);
+  const flowHeadingRef = useRef(null);
+
+  useEffect(() => () => abortRef.current?.abort(), []);
+  useEffect(() => {
+    if (flow) flowHeadingRef.current?.focus();
+  }, [flow]);
+  useEffect(() => {
+    if (!flow?.expires_at) return undefined;
+    const remaining = Date.parse(flow.expires_at) - Date.now();
+    const expire = () => {
+      abortRef.current?.abort();
+      abortRef.current = null;
+      setFlow(null);
+      setAuthorizationResponse("");
+      setAuthorizationBusy("");
+      setAuthorizationMessage("Authorization expired. Start again.");
+    };
+    if (!Number.isFinite(remaining) || remaining <= 0) {
+      expire();
+      return undefined;
+    }
+    const timer = window.setTimeout(expire, remaining);
+    return () => window.clearTimeout(timer);
+  }, [flow]);
+
+  function cancelAuthorization() {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setFlow(null);
+    setAuthorizationResponse("");
+    setAuthorizationBusy("");
+    setAuthorizationMessage("");
+  }
+
+  function selectOAuthProvider(nextProviderID) {
+    cancelAuthorization();
+    setAuthorizationMessage("");
+    setProviderID(nextProviderID);
+    const account = accounts.find((candidate) => candidate.provider_id === nextProviderID);
+    setAccountID(account?.id || providers.find((candidate) => candidate.id === nextProviderID)?.default_account_id || nextProviderID);
+  }
+
+  async function beginAuthorization() {
+    const selectedAccountID = accountID.trim();
+    if (!providerID || !selectedAccountID) return;
+    cancelAuthorization();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setAuthorizationBusy("starting");
+    setAuthorizationMessage("");
+    try {
+      const started = await startOAuthAuthorization(selectedAccountID, providerID, controller.signal);
+      if (controller.signal.aborted) return;
+      setFlow(started);
+      if (providerID === "codex") {
+        setAuthorizationBusy("waiting");
+        setAuthorizationMessage("Waiting for approval in ChatGPT...");
+        await pollCodexAuthorization(selectedAccountID, started, controller);
+      } else {
+        setAuthorizationBusy("");
+        setAuthorizationMessage("");
+      }
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      setFlow(null);
+      setAuthorizationBusy("");
+      setAuthorizationMessage(error.message || "Could not start authorization.");
+    }
+  }
+
+  async function pollCodexAuthorization(selectedAccountID, started, controller) {
+    const deadline = Date.parse(started.expires_at);
+    const delay = Math.max(Number(started.interval_seconds) || 5, 1) * 1000 + 500;
+    try {
+      while (!Number.isFinite(deadline) || Date.now() < deadline) {
+        await waitForOAuthPoll(delay, controller.signal);
+        let result;
+        try {
+          result = await completeOAuthAuthorization(selectedAccountID, started.flow_id, "", controller.signal);
+        } catch (error) {
+          if (error?.payload?.retryable) {
+            setAuthorizationMessage("Authorized. Retrying local credential save...");
+            continue;
+          }
+          throw error;
+        }
+        if (result?.status === "pending") continue;
+        if (controller.signal.aborted) return;
+        setFlow(null);
+        setAuthorizationBusy("");
+        setAuthorizationMessage("ChatGPT connected.");
+        await onChanged();
+        return;
+      }
+      throw new Error("ChatGPT authorization expired. Start again.");
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      setFlow(null);
+      setAuthorizationBusy("");
+      setAuthorizationMessage(error.message || "Could not complete ChatGPT authorization.");
+    }
+  }
+
+  async function completeClaudeAuthorization() {
+    if (!flow || !authorizationResponse.trim()) return;
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setAuthorizationBusy("completing");
+    setAuthorizationMessage("");
+    try {
+      await completeOAuthAuthorization(accountID.trim(), flow.flow_id, authorizationResponse.trim(), controller.signal);
+      if (controller.signal.aborted) return;
+      setFlow(null);
+      setAuthorizationResponse("");
+      setAuthorizationBusy("");
+      setAuthorizationMessage("Claude connected.");
+      await onChanged();
+    } catch (error) {
+      if (error?.name === "AbortError") return;
+      setAuthorizationBusy("");
+      if (error?.payload?.retryable) {
+        setAuthorizationMessage("Authorized, but the credential could not be saved. Submit again to retry.");
+        return;
+      }
+      setFlow(null);
+      setAuthorizationMessage(error.message || "Could not complete Claude authorization.");
+    }
+  }
+
+  const destinationURL = flow?.authorization_url || flow?.verification_url;
+  return <div className="oauth-connect">
+    <div className="settings-subheading"><span className="panel-kicker">SUBSCRIPTION SIGN-IN</span><h3>Connect ChatGPT Plus or Claude Pro / Max</h3></div>
+    <p className="credential-import__copy">Authorize OpenUsage directly. No Codex or Claude CLI is required, and tokens stay in the local credentials store.</p>
+    <div className="form-grid form-grid--credential">
+      <SettingField label="Subscription"><select disabled={Boolean(authorizationBusy || flow)} value={providerID} onChange={(event) => selectOAuthProvider(event.target.value)}>{providers.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select></SettingField>
+      <SettingField label="Account ID"><input disabled={Boolean(authorizationBusy || flow)} value={accountID} onChange={(event) => setAccountID(event.target.value)} placeholder="my-account" /></SettingField>
+    </div>
+    {!flow ? <div className="oauth-start-actions"><button className="button button--primary" disabled={!providerID || !accountID.trim() || Boolean(authorizationBusy)} onClick={beginAuthorization} type="button">{authorizationBusy === "starting" ? "Starting..." : `Connect ${providerID === "codex" ? "ChatGPT" : "Claude"}`}<Icon name="external" size={15} /></button>{authorizationBusy === "starting" ? <button className="text-button text-button--danger" onClick={cancelAuthorization} type="button">Cancel</button> : null}</div> : null}
+    {flow ? <div aria-live="polite" className="oauth-flow-card">
+      <div className="oauth-flow-card__copy"><strong ref={flowHeadingRef} tabIndex="-1">{providerID === "codex" ? "Enter this code in ChatGPT" : "Approve access in Claude"}</strong><span>{providerID === "codex" ? "This code expires in 15 minutes. OpenUsage checks for approval automatically." : "Claude will show a code after approval. Return here to finish."}</span></div>
+      {flow.user_code ? <code className="oauth-device-code">{flow.user_code}</code> : null}
+      <div className="oauth-flow-actions">{destinationURL ? <a className="button button--secondary" href={destinationURL} rel="noreferrer" target="_blank">Open {providerID === "codex" ? "ChatGPT" : "Claude"}<Icon name="external" size={14} /></a> : null}<button className="text-button text-button--danger" onClick={cancelAuthorization} type="button">Cancel</button></div>
+      {providerID === "claude_code" ? <form className="oauth-code-form" onSubmit={(event) => { event.preventDefault(); completeClaudeAuthorization(); }}><label htmlFor="claude-authorization-code">Authorization code</label><div className="credential-input-row"><input autoCapitalize="none" autoComplete="off" autoCorrect="off" id="claude-authorization-code" onChange={(event) => setAuthorizationResponse(event.target.value)} placeholder="Paste Claude authorization code" spellCheck="false" value={authorizationResponse} /><button className="button button--primary" disabled={!authorizationResponse.trim() || authorizationBusy === "completing"} type="submit">{authorizationBusy === "completing" ? "Connecting..." : "Finish sign-in"}</button></div><small>Paste the complete code Claude displays, including the part after #.</small></form> : null}
+    </div> : null}
+    {authorizationMessage ? <div className={`oauth-status${authorizationMessage.includes("connected") ? " oauth-status--ok" : ""}`} role="status"><Icon name={authorizationMessage.includes("connected") ? "check" : authorizationBusy === "waiting" ? "refresh" : "warning"} size={14} />{authorizationMessage}</div> : null}
+  </div>;
+}
+
+function waitForOAuthPoll(delay, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(new DOMException("Authorization cancelled", "AbortError"));
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, delay);
+    function onAbort() {
+      window.clearTimeout(timer);
+      reject(new DOMException("Authorization cancelled", "AbortError"));
+    }
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+function OAuthCredentialForm({ accountID, busy, credentialsJSON, onAccountChange, onJSONChange, onProviderChange, providerID, providers, update }) {
+  return <details className="credential-import"><summary>Advanced: import an existing CLI auth file</summary><div className="credential-import__body"><p className="credential-import__copy">Use this fallback when you already have a provider auth file. OpenUsage keeps only the token fields it needs.</p><div className="form-grid form-grid--credential"><SettingField label="Provider"><select value={providerID} onChange={(event) => onProviderChange(event.target.value)}>{providers.map((provider) => <option key={provider.id} value={provider.id}>{provider.name}</option>)}</select></SettingField><SettingField label="Account ID"><input value={accountID} onChange={(event) => onAccountChange(event.target.value)} placeholder="my-account" /></SettingField></div><SettingField label="Auth file JSON" detail="Claude Code: ~/.claude/.credentials.json · Codex: ~/.codex/auth.json"><textarea autoComplete="off" onChange={(event) => onJSONChange(event.target.value)} placeholder="Paste the JSON file contents" rows="7" spellCheck="false" value={credentialsJSON} /><button className="button button--primary" disabled={!providerID || !accountID.trim() || !credentialsJSON.trim() || Boolean(busy)} onClick={() => update("oauth", async () => { await saveOAuthCredential(accountID.trim(), providerID, credentialsJSON); onJSONChange(""); })} type="button">{busy === "oauth" ? "Importing..." : "Import local sign-in"}<Icon name="arrow" size={15} /></button></SettingField></div></details>;
+}
+
+function CredentialRow({ account, bootstrap, busy, onDelete, onDeleteOAuth }) {
   const provider = bootstrap?.providers?.find((item) => item.id === account.provider_id);
-  return <div className="credential-row"><ProviderIcon name={provider?.name || account.provider_id} providerID={account.provider_id} size={28} /><div className="credential-row__copy"><strong>{accountName(account.id)}</strong><span>{provider?.name || providerName(account.provider_id, bootstrap?.providers)} · {account.credential?.present ? `${account.credential.source || "configured"} credential` : "missing credential"}</span></div><span className={`credential-state credential-state--${account.credential?.present ? "ready" : "missing"}`}>{account.credential?.present ? "Ready" : "Missing"}</span>{account.credential?.present && account.credential?.source === "stored" ? <button className="icon-button icon-button--danger" aria-label={`Delete credential for ${accountName(account.id)}`} disabled={busy === `delete:${account.id}`} onClick={onDelete} type="button"><Icon name="close" size={15} /></button> : null}</div>;
+  const credential = account.credential || {};
+  const isOAuth = credential.kind === "oauth" || credential.kind === "token";
+  const state = credential.expired ? "expired" : credential.present ? "ready" : "missing";
+  return <div className="credential-row"><ProviderIcon name={provider?.name || account.provider_id} providerID={account.provider_id} size={28} /><div className="credential-row__copy"><strong>{accountName(account.id)}</strong><span>{provider?.name || providerName(account.provider_id, bootstrap?.providers)} · {credentialDescription(credential)}</span></div><span className={`credential-state credential-state--${state}`}>{credential.expired ? "Expired" : credential.present ? "Ready" : "Missing"}</span>{credential.present && credential.source === "stored" && isOAuth ? <button className="icon-button icon-button--danger" aria-label={`Delete OAuth credential for ${accountName(account.id)}`} disabled={busy === `delete-oauth:${account.id}`} onClick={onDeleteOAuth} type="button"><Icon name="close" size={15} /></button> : null}{credential.present && credential.source === "stored" && !isOAuth ? <button className="icon-button icon-button--danger" aria-label={`Delete credential for ${accountName(account.id)}`} disabled={busy === `delete:${account.id}`} onClick={onDelete} type="button"><Icon name="close" size={15} /></button> : null}</div>;
+}
+
+function credentialDescription(credential) {
+  if (!credential.present) return "missing credential";
+  const parts = [credential.source || "configured", `${credential.kind || "credential"} credential`];
+  if (credential.expired) parts.push("expired");
+  else if (credential.expires_at) parts.push(`expires ${new Date(credential.expires_at).toLocaleString()}`);
+  return parts.join(" · ");
 }
 
 function IntegrationSettings({ bootstrap, busy, update }) {

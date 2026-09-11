@@ -9,8 +9,10 @@ import {
 import {
   getBootstrap,
   getSnapshots,
+  clearAccessToken,
   installDaemon,
   patchTimeWindow,
+  setAccessToken,
 } from "./api";
 import {
   accountName,
@@ -40,14 +42,25 @@ import "../dashboard.css";
 
 const defaultWindow = "30d";
 
-function readRoute() {
-  const path = window.location.pathname.replace(/\/+$/, "") || "/app";
-  if (path === "/app/settings") return { page: "settings", accountID: "" };
-  if (path === "/app/analytics") return { page: "analytics", accountID: "" };
-  if (path.startsWith("/app/provider/")) {
+function normalizedBasePath(basePath) {
+  const normalized = String(basePath || "").trim().replace(/\/+$/, "");
+  return normalized === "/" ? "" : normalized;
+}
+
+function dashboardPath(basePath, suffix = "") {
+  const base = normalizedBasePath(basePath);
+  return suffix ? `${base}/${suffix}` || `/${suffix}` : base || "/";
+}
+
+function readRoute(basePath = "/app") {
+  const path = window.location.pathname.replace(/\/+$/, "") || normalizedBasePath(basePath) || "/";
+  if (path === dashboardPath(basePath, "settings")) return { page: "settings", accountID: "" };
+  if (path === dashboardPath(basePath, "analytics")) return { page: "analytics", accountID: "" };
+  const providerPrefix = `${dashboardPath(basePath, "provider")}/`;
+  if (path.startsWith(providerPrefix)) {
     let accountID;
     try {
-      accountID = decodeURIComponent(path.slice("/app/provider/".length));
+      accountID = decodeURIComponent(path.slice(providerPrefix.length));
     } catch {
       return { page: "overview", accountID: "" };
     }
@@ -59,21 +72,22 @@ function readRoute() {
   return { page: "overview", accountID: "" };
 }
 
-function navigateTo(page, accountID = "") {
+function navigateTo(basePath, page, accountID = "") {
   const path = accountID
-    ? `/app/provider/${encodeURIComponent(accountID)}`
-    : `/app/${page === "overview" ? "" : `${page}/`}`;
+    ? dashboardPath(basePath, `provider/${encodeURIComponent(accountID)}`)
+    : dashboardPath(basePath, page === "overview" ? "" : page);
   window.history.pushState({}, "", path);
   window.dispatchEvent(new PopStateEvent("popstate"));
 }
 
-export default function DashboardApp() {
-  const [route, setRoute] = useState(readRoute);
+export default function DashboardApp({ basePath = "/app" }) {
+  const [route, setRoute] = useState(() => readRoute(basePath));
   const [bootstrap, setBootstrap] = useState(null);
   const [snapshots, setSnapshots] = useState({});
   const [windowID, setWindowID] = useState("");
   const [snapshotWindow, setSnapshotWindow] = useState("");
   const [loading, setLoading] = useState(true);
+  const [authRequired, setAuthRequired] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -84,6 +98,38 @@ export default function DashboardApp() {
   const requestInFlight = useRef(false);
   const deferredQuery = useDeferredValue(query);
 
+  function isUnauthorized(requestError) {
+    return requestError?.status === 401;
+  }
+
+  function showAccessGate() {
+    clearAccessToken();
+    setBootstrap(null);
+    setSnapshots({});
+    setAuthRequired(true);
+    setError("");
+  }
+
+  async function loadWorkspace() {
+    return Promise.all([
+      getBootstrap(),
+      getSnapshots(),
+    ]);
+  }
+
+  function applyWorkspace([loadedBootstrap, loadedSnapshots]) {
+    const configuredWindow = loadedBootstrap?.settings?.data?.time_window
+      || loadedSnapshots?.window
+      || defaultWindow;
+    setBootstrap(loadedBootstrap);
+    setWindowID(configuredWindow);
+    setSnapshotWindow(loadedSnapshots?.window || configuredWindow);
+    setSnapshots(loadedSnapshots?.snapshots || {});
+    setLastUpdated(Date.now());
+    setAuthRequired(false);
+    setError("");
+  }
+
   useEffect(() => {
     const previousTitle = document.title;
     document.title = "OpenUsage Dashboard";
@@ -92,12 +138,12 @@ export default function DashboardApp() {
 
   useEffect(() => {
     const onPopState = () => {
-      startTransition(() => setRoute(readRoute()));
+      startTransition(() => setRoute(readRoute(basePath)));
       setMobileNavOpen(false);
     };
     window.addEventListener("popstate", onPopState);
     return () => window.removeEventListener("popstate", onPopState);
-  }, []);
+  }, [basePath]);
 
   async function refreshSnapshots(silent = false, requestedWindow = windowID) {
     if (requestInFlight.current) return;
@@ -110,6 +156,10 @@ export default function DashboardApp() {
       setLastUpdated(Date.now());
       setError("");
     } catch (requestError) {
+      if (isUnauthorized(requestError)) {
+        showAccessGate();
+        return;
+      }
       setError(requestError.message || "Could not load usage data.");
     } finally {
       requestInFlight.current = false;
@@ -125,21 +175,13 @@ export default function DashboardApp() {
 
     setLoading(true);
     try {
-      const [loadedBootstrap, loadedSnapshots] = await Promise.all([
-        getBootstrap(),
-        getSnapshots(),
-      ]);
-      const configuredWindow = loadedBootstrap?.settings?.data?.time_window
-        || loadedSnapshots?.window
-        || defaultWindow;
-      setBootstrap(loadedBootstrap);
-      setWindowID(configuredWindow);
-      setSnapshotWindow(loadedSnapshots?.window || configuredWindow);
-      setSnapshots(loadedSnapshots?.snapshots || {});
-      setLastUpdated(Date.now());
-      setError("");
+      applyWorkspace(await loadWorkspace());
     } catch (requestError) {
-      setError(requestError.message || "Could not connect to OpenUsage.");
+      if (isUnauthorized(requestError)) {
+        showAccessGate();
+      } else {
+        setError(requestError.message || "Could not connect to OpenUsage.");
+      }
     } finally {
       setLoading(false);
     }
@@ -150,22 +192,17 @@ export default function DashboardApp() {
     async function loadInitialData() {
       setLoading(true);
       try {
-        const [loadedBootstrap, loadedSnapshots] = await Promise.all([
-          getBootstrap(),
-          getSnapshots(),
-        ]);
+        const workspace = await loadWorkspace();
         if (cancelled) return;
-        const configuredWindow = loadedBootstrap?.settings?.data?.time_window
-          || loadedSnapshots?.window
-          || defaultWindow;
-        setBootstrap(loadedBootstrap);
-        setWindowID(configuredWindow);
-        setSnapshotWindow(loadedSnapshots?.window || configuredWindow);
-        setSnapshots(loadedSnapshots?.snapshots || {});
-        setLastUpdated(Date.now());
-        setError("");
+        applyWorkspace(workspace);
       } catch (requestError) {
-        if (!cancelled) setError(requestError.message || "Could not connect to OpenUsage.");
+        if (!cancelled) {
+          if (isUnauthorized(requestError)) {
+            showAccessGate();
+          } else {
+            setError(requestError.message || "Could not connect to OpenUsage.");
+          }
+        }
       } finally {
         if (!cancelled) setLoading(false);
       }
@@ -173,6 +210,25 @@ export default function DashboardApp() {
     loadInitialData();
     return () => { cancelled = true; };
   }, []);
+
+  async function handleAccessToken(value) {
+    setAccessToken(value);
+    setLoading(true);
+    setError("");
+    try {
+      applyWorkspace(await loadWorkspace());
+    } catch (requestError) {
+      if (isUnauthorized(requestError)) {
+        clearAccessToken();
+        setAuthRequired(true);
+        setError("That access token was rejected.");
+      } else {
+        setError(requestError.message || "Could not connect to OpenUsage.");
+      }
+    } finally {
+      setLoading(false);
+    }
+  }
 
   useEffect(() => {
     if (!bootstrap || !windowID) return undefined;
@@ -203,7 +259,7 @@ export default function DashboardApp() {
   const totals = useMemo(() => aggregateTotals(snapshots), [snapshots]);
 
   function navigate(page, accountID = "") {
-    navigateTo(page, accountID);
+    navigateTo(basePath, page, accountID);
   }
 
   async function handleWindowChange(nextWindow) {
@@ -251,6 +307,7 @@ export default function DashboardApp() {
   }
 
   if (loading) return <LoadingScreen />;
+  if (authRequired) return <AccessGate error={error} onSubmit={handleAccessToken} />;
 
   const pageTitle = route.page === "analytics"
     ? "Analytics"
@@ -674,6 +731,25 @@ function ProgressBar({ percent, tone }) {
 
 function LoadingScreen() {
   return <div className="dashboard-loading-screen"><BrandMark /><div className="loading-pulse"><span /><span /><span /></div><p>Connecting to your local usage data...</p></div>;
+}
+
+function AccessGate({ error, onSubmit }) {
+  const [token, setToken] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  async function submit(event) {
+    event.preventDefault();
+    const value = token.trim();
+    if (!value || submitting) return;
+    setSubmitting(true);
+    try {
+      await onSubmit(value);
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return <main className="dashboard-access-screen"><section className="dashboard-access-card panel"><BrandMark /><span className="eyebrow eyebrow--accent">PRIVATE WORKSPACE</span><h1>Unlock your OpenUsage dashboard.</h1><p>This instance requires the web access token configured by its owner. It is kept in an HttpOnly cookie after sign-in.</p><form onSubmit={submit}><label className="setting-field"><span>Web access token</span><input autoComplete="current-password" autoFocus onChange={(event) => setToken(event.target.value)} placeholder="Paste token" type="password" value={token} /></label><button className="button button--primary" disabled={!token.trim() || submitting} type="submit">{submitting ? "Checking..." : "Unlock dashboard"}<Icon name="arrow" size={15} /></button></form>{error ? <div className="dashboard-access-error" role="alert"><Icon name="warning" size={15} />{error}</div> : null}<small className="dashboard-access-note"><Icon name="shield" size={14} />The token is not stored in browser storage.</small></section></main>;
 }
 
 function metricValueForGauge(metric) {

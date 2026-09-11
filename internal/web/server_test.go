@@ -346,6 +346,33 @@ func TestPublicAPIRequiresAccessTokenAndLeavesHealthOpen(t *testing.T) {
 	}
 }
 
+func TestPublicAPIBearerAccessIssuesCookie(t *testing.T) {
+	server, err := NewServer(Options{
+		AllowPublic:  true,
+		AuthToken:    "web-secret",
+		ConfigLoader: func() (config.Config, error) { return config.DefaultConfig(), nil },
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/v1/bootstrap", nil)
+	request.Header.Set("Authorization", "Bearer web-secret")
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Set-Cookie") == "" {
+		t.Fatalf("bearer response = %d headers=%#v", response.Code, response.Header())
+	}
+
+	request = httptest.NewRequest(http.MethodGet, "http://127.0.0.1:8787/api/v1/bootstrap", nil)
+	request.Header.Set("Cookie", response.Header().Get("Set-Cookie"))
+	response = httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("cookie-only response = %d: %s", response.Code, response.Body)
+	}
+}
+
 func TestStaticServingUsesSPAFallbackAndRejectsTraversal(t *testing.T) {
 	staticDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(staticDir, "index.html"), []byte("dashboard shell"), 0o644); err != nil {
@@ -380,6 +407,9 @@ func TestStaticServingUsesSPAFallbackAndRejectsTraversal(t *testing.T) {
 	if resp := get("/app/providers"); resp.Code != http.StatusOK || resp.Body.String() != "dashboard shell" {
 		t.Fatalf("SPA fallback = %d %q", resp.Code, resp.Body.String())
 	}
+	if resp := get("/"); resp.Code != http.StatusOK || resp.Body.String() != "dashboard shell" {
+		t.Fatalf("root shell = %d %q", resp.Code, resp.Body.String())
+	}
 	if resp := get("/app/providers"); resp.Header().Get("X-Frame-Options") != "DENY" || resp.Header().Get("Content-Security-Policy") != "frame-ancestors 'none'" {
 		t.Fatalf("frame protection headers = %#v", resp.Header())
 	}
@@ -391,6 +421,26 @@ func TestStaticServingUsesSPAFallbackAndRejectsTraversal(t *testing.T) {
 	}
 	if resp := get("/../index.html"); resp.Code != http.StatusNotFound {
 		t.Fatalf("traversal status = %d, want 404", resp.Code)
+	}
+}
+
+func TestNormalizeDashboardPath(t *testing.T) {
+	for _, tc := range []struct {
+		input string
+		want  string
+	}{
+		{input: "", want: "/app/"},
+		{input: "/app", want: "/app/"},
+		{input: "/app/", want: "/app/"},
+		{input: "/", want: "/"},
+	} {
+		got, err := NormalizeDashboardPath(tc.input)
+		if err != nil || got != tc.want {
+			t.Fatalf("NormalizeDashboardPath(%q) = %q, %v; want %q", tc.input, got, err, tc.want)
+		}
+	}
+	if _, err := NormalizeDashboardPath("/dashboard/"); err == nil {
+		t.Fatal("unsupported dashboard path was accepted")
 	}
 }
 
